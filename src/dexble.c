@@ -37,13 +37,17 @@ static JNIEnv *any_env(void){
     if((*g_vm)->AttachCurrentThread(g_vm,(void**)&e,0)==0) return e;
     return 0;
 }
-void dexble_alarm(int high){
-    JNIEnv *e=any_env(); if(!e||!g_alarm_cls) return;
-    (*e)->CallStaticVoidMethod(e,g_alarm_cls,m_alarm_trigger,g_ctx,(jboolean)high);
+void dexble_alarm(int high, int sound, int vibrate){
+    JNIEnv *e=any_env();
+    if(!e||!g_alarm_cls||!m_alarm_trigger){ LOGI("alarm: cannot fire (e=%p cls=%p m=%p)",(void*)e,(void*)g_alarm_cls,(void*)m_alarm_trigger); return; }
+    LOGI("alarm: fire trigger high=%d sound=%d vib=%d",high,sound,vibrate);
+    (*e)->CallStaticVoidMethod(e,g_alarm_cls,m_alarm_trigger,g_ctx,(jboolean)high,(jboolean)sound,(jboolean)vibrate);
+    if((*e)->ExceptionCheck(e)){ LOGI("alarm: java threw"); (*e)->ExceptionClear(e); }
 }
 void dexble_alarm_silence(void){
-    JNIEnv *e=any_env(); if(!e||!g_alarm_cls) return;
+    JNIEnv *e=any_env(); if(!e||!g_alarm_cls||!m_alarm_silence) return;
     (*e)->CallStaticVoidMethod(e,g_alarm_cls,m_alarm_silence,g_ctx);
+    if((*e)->ExceptionCheck(e)) (*e)->ExceptionClear(e);
 }
 
 /* ---- drv_* transport hooks (called by the driver, cur_env valid) ---- */
@@ -149,12 +153,17 @@ int dexble_register(JNIEnv *e, jclass ble, jobject ctx){
     m_startsvc =(*e)->GetStaticMethodID(e,ble,"startService","(Landroid/content/Context;)V");
     if(m_startsvc) (*e)->CallStaticVoidMethod(e,g_ble,m_startsvc,g_ctx);   /* keep alive in bg */
     (*e)->GetJavaVM(e,&g_vm);
-    { jclass ac=(*e)->FindClass(e,"com/jk/stealo/Alarm");
-      if(ac){ g_alarm_cls=(*e)->NewGlobalRef(e,ac);
-          m_alarm_trigger=(*e)->GetStaticMethodID(e,ac,"trigger","(Landroid/content/Context;Z)V");
-          m_alarm_silence=(*e)->GetStaticMethodID(e,ac,"silence","(Landroid/content/Context;)V");
-      } else (*e)->ExceptionClear(e); }
     return m_connect && m_subscribe && m_write && m_readrssi && m_read;
+}
+/* Wire the Alarm class. FindClass here would resolve via the framework loader,
+ * which can't see app classes, so main.c loads it via the activity's classloader
+ * (find_app_class) and hands it in. */
+void dexble_set_alarm(JNIEnv *e, jclass alarm_cls){
+    if(!alarm_cls){ LOGI("alarm class not wired (null)"); return; }
+    g_alarm_cls=(*e)->NewGlobalRef(e,alarm_cls);
+    m_alarm_trigger=(*e)->GetStaticMethodID(e,alarm_cls,"trigger","(Landroid/content/Context;ZZZ)V");
+    m_alarm_silence=(*e)->GetStaticMethodID(e,alarm_cls,"silence","(Landroid/content/Context;)V");
+    LOGI("alarm class wired (trigger=%p silence=%p)",(void*)m_alarm_trigger,(void*)m_alarm_silence);
 }
 void dexble_pair(JNIEnv *e, const char *mac, const char *code){
     cur_env=e; driver_start(mac,code); cur_env=0;

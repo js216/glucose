@@ -39,7 +39,7 @@ public final class Alarm {
         nm.createNotificationChannel(c);
     }
 
-    public static void trigger(Context ctx, boolean high) {
+    public static void trigger(Context ctx, boolean high, boolean sound, boolean vibrate) {
         try {
             Context app = ctx.getApplicationContext();
             NotificationManager nm = app.getSystemService(NotificationManager.class);
@@ -62,13 +62,13 @@ public final class Alarm {
             nm.notify(NID, n);
 
             Vibrator v = app.getSystemService(Vibrator.class);
-            if (v != null && v.hasVibrator())      /* 600ms on / 400ms off, repeating */
+            if (vibrate && v != null && v.hasVibrator())   /* 600ms on / 400ms off, repeating */
                 v.vibrate(VibrationEffect.createWaveform(new long[]{0, 600, 400}, 0));
 
             stopSound();
             Uri uri = RingtoneManager.getActualDefaultRingtoneUri(app, RingtoneManager.TYPE_ALARM);
             if (uri == null) uri = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_ALARM);
-            if (uri != null) {
+            if (sound && uri != null) {
                 player = new MediaPlayer();
                 player.setAudioAttributes(new AudioAttributes.Builder()
                     .setUsage(AudioAttributes.USAGE_ALARM)

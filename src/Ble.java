@@ -20,7 +20,10 @@ import android.bluetooth.le.BluetoothLeScanner;
 import android.bluetooth.le.ScanCallback;
 import android.bluetooth.le.ScanResult;
 import android.bluetooth.le.ScanSettings;
+import android.app.Activity;
 import android.content.Context;
+import android.content.pm.ActivityInfo;
+import android.content.pm.PackageManager;
 import android.util.Log;
 
 import java.util.ArrayDeque;
@@ -32,6 +35,43 @@ public final class Ble {
         UUID.fromString("00002902-0000-1000-8000-00805f9b34fb");
 
     public static int ping() { return 42; }
+
+    /* ---- settings-menu helpers (ctx is the NativeActivity, i.e. an Activity) ---- */
+    /* mode: 0 portrait, 1 landscape, 2 gravity (sensor always), 3 system (sensor
+     * only if the OS auto-rotate setting allows it) */
+    public static void setOrientation(Context ctx, int mode) {
+        try {
+            if (!(ctx instanceof Activity)) return;
+            int o;
+            switch (mode) {
+                case 1:  o = ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE;   break;
+                case 2:  o = ActivityInfo.SCREEN_ORIENTATION_FULL_SENSOR; break;
+                case 3:  o = ActivityInfo.SCREEN_ORIENTATION_USER;        break;
+                default: o = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT;    break;
+            }
+            ((Activity) ctx).setRequestedOrientation(o);
+        } catch (Throwable t) { Log.i(TAG, "orient: " + t); }
+    }
+    public static boolean permGranted(Context ctx, String perm) {
+        try { return ctx.checkSelfPermission(perm) == PackageManager.PERMISSION_GRANTED; }
+        catch (Throwable t) { return false; }
+    }
+    public static void requestPerm(Context ctx, String perm) {
+        try {
+            if (ctx instanceof Activity)
+                ((Activity) ctx).requestPermissions(new String[]{ perm }, 0);
+        } catch (Throwable t) { Log.i(TAG, "reqperm: " + t); }
+    }
+    /* app details page — the only place the user can REVOKE an already-granted one */
+    public static void openAppSettings(Context ctx) {
+        try {
+            android.content.Intent i = new android.content.Intent(
+                android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                android.net.Uri.parse("package:" + ctx.getPackageName()));
+            i.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK);
+            ctx.startActivity(i);
+        } catch (Throwable t) { Log.i(TAG, "appsettings: " + t); }
+    }
 
     /* start the foreground service so BLE keeps running in the background, and
      * ask to be exempted from battery optimisation so Doze can't kill us */

@@ -214,6 +214,7 @@ static ANativeWindow   *g_win;
 static int       g_scanning;
 static jclass    g_ble;                /* global ref to com.jk.stealo.Ble */
 static jmethodID g_scan, g_stop;
+static jmethodID m_set_orient, m_perm_granted, m_req_perm, m_open_settings;   /* settings-menu ops */
 static char      g_status[MAX_COLS + 1] = "STARTING";
 static struct dev g_devs[MAX_DEVS];
 static int       g_ndevs;
@@ -226,9 +227,10 @@ static int       g_pairing_started;
 /* dexble driver (dexble.c) */
 void dexble_init(const char *data_dir);
 int  dexble_register(JNIEnv *env, jclass ble, jobject ctx);
+void dexble_set_alarm(JNIEnv *env, jclass alarm_cls);
 void dexble_pair(JNIEnv *env, const char *mac, const char *code);
 void dexble_request_devinfo(void);
-void dexble_alarm(int high);
+void dexble_alarm(int high, int sound, int vibrate);
 void dexble_alarm_silence(void);
 #define PAIR_CODE "9973"   /* Stelo applicator pairing code (rebuild to change) */
 
@@ -260,12 +262,35 @@ static int  g_alarm_low = 110, g_alarm_high = 300;
 static char g_alarm_path[256];
 static int  g_alarm_state;                      /* last reading's zone: 0 ok, 1 low, 2 high */
 static int  g_alarm_sounding;                   /* an audible alarm is currently active */
+
+/* settings menu (opened by tapping the big-number band) */
+static int  g_menu;                             /* settings menu open */
+static int  g_sound_on = 1, g_vib_on = 1;       /* alarm sound / vibration enabled */
+static int  g_orient;                           /* 0 portrait 1 landscape 2 gravity 3 system */
+static int  g_units;                            /* 0 mg/dL, 1 mmol/L */
+static int  g_disc;                             /* stale-data alarm: index into DISC_MIN */
+static const char *ORIENT_LBL[] = { "PORTRAIT", "LANDSCAPE", "GRAVITY", "SYSTEM" };
+static const int   DISC_MIN[]   = { 0, 10, 30, 60 };
+static const char *DISC_LBL[]   = { "OFF", "10 MIN", "30 MIN", "60 MIN" };
+static long g_launch_t;                          /* for the stale-alarm grace period */
+static int  g_disc_alarmed;                      /* stale alarm currently latched */
+static char g_settings_path[256];
+static int  g_big_y0, g_big_y1;                 /* big-number vertical band (tap to open menu) */
+#define MENU_MAX 16
+static struct { int x, y, w, h, action; } g_menu_items[MENU_MAX];
+static int  g_menu_n;
+static const char *PERMS[]  = { "android.permission.BLUETOOTH_SCAN",
+                                "android.permission.BLUETOOTH_CONNECT",
+                                "android.permission.POST_NOTIFICATIONS" };
+static const char *PERM_LBL[] = { "BT SCAN", "BT CONNECT", "NOTIFY" };
+#define NPERMS 3
 static int  g_al_x[4], g_al_w[4], g_al_y, g_al_h;   /* 0:LOW- 1:LOW+ 2:HIGH- 3:HIGH+ */
 static int  g_al_held = -1;                     /* alarm button held for auto-repeat */
 static int  g_timerfd = -1;                     /* shared repaint / repeat timer */
 /* plot rectangle (set during draw) + press-and-hold scrub selection */
 static int  g_plot_x, g_plot_y, g_plot_w, g_plot_h;
 static int  g_scrub_idx = -1;                  /* highlighted point, -1 = none */
+static int  g_scrubbing;                        /* a plot drag is in progress */
 #define COL_HILITE 0xFFAAAAAA                   /* scrub highlight dot (gray) */
 
 static long realtime_s(void)
@@ -296,6 +321,13 @@ static uint32_t glu_color(int g)
     return 0xFFFFFFFF;                /* white  */
 }
 static uint32_t white_color(int g) { (void)g; return 0xFFFFFFFF; }   /* plot dots */
+/* format a mg/dL value in the current display unit (mmol/L = mg/dL / 18, 1 dp) */
+static void fmt_glu(int mgdl, char *out, int n)
+{
+    if (g_units) { int t = (mgdl * 10 + 9) / 18; snprintf(out, n, "%d.%d", t / 10, t % 10); }
+    else           snprintf(out, n, "%d", mgdl);
+}
+#define UNIT_LBL (g_units ? "MMOL/L" : "MG/DL")
 
 /* Insert a reading into the display history, kept newest-first and deduped
  * (readings within 150 s are the same 5-min sample). Handles out-of-order
@@ -468,6 +500,190 @@ static void draw_str(uint32_t *px, const ANativeWindow_Buffer *buf,
 }
 static int str_len(const char *s) { int n = 0; while (s[n]) n++; return n; }
 
+static void draw_settings(uint32_t *px, const ANativeWindow_Buffer *buf, int sc);
+
+/* Left/top column: big number + right column, plot tabs, plot, alarm config row.
+ * Drawn into the column [cx, cx+cw); returns the y just below the last row. */
+static int draw_glucose(uint32_t *px, const ANativeWindow_Buffer *buf, int cx, int cw, int y, int sc, int bottom)
+{
+    int landscape = bottom > 0;                /* height-constrained column */
+    int pad = landscape ? 6 * sc : 18 * sc;    /* vertical padding around the number */
+    int scrub = (g_scrub_idx >= 0 && g_scrub_idx < g_nhist);
+    int stale = realtime_s() - g_cur_time > 360;
+    char big[8]; uint32_t bigcol;
+    if (stale) { snprintf(big, sizeof big, "---");     bigcol = 0xFF888888; }
+    else       { fmt_glu(g_cur_glu, big, sizeof big);  bigcol = glu_color(g_cur_glu); }
+    g_big_y0 = 0;
+    y += landscape ? 4 * sc : 12 * sc;
+    char tr[8], agestr[12];
+    if (stale) snprintf(tr, sizeof tr, "---");
+    else       fmt_trend(g_cur_trend, tr, sizeof tr);
+    long a = realtime_s() - g_cur_time; if (a < 0) a = 0;
+    if (a < 600) snprintf(agestr, sizeof agestr, "%ld S", a);
+    else         snprintf(agestr, sizeof agestr, "%ld M", a / 60);
+    int col_w = str_len(UNIT_LBL) * 6 * sc, gap = 6 * sc;
+    int bigsc = sc * 10;                        /* shrink so number + unit column fit cw */
+    int fit = (cw - 4 * sc - gap - col_w) / (str_len(big) * 6);
+    if (bigsc > fit) bigsc = fit;
+    if (bigsc < 2 * sc) bigsc = 2 * sc;
+    int big_w = str_len(big) * 6 * bigsc;
+    int bx = cx + (cw - (big_w + gap + col_w)) / 2;
+    if (bx < cx + 2 * sc) bx = cx + 2 * sc;
+    draw_str(px, buf, bx, y, bigsc, big, bigcol);
+    int colx = bx + big_w + gap;
+    int gh = 7 * sc, bh = 8 * bigsc;
+    int mid = y + (bh - gh) / 2, spread = (bh - gh) / 4;
+    draw_str(px, buf, colx, mid - spread, sc, UNIT_LBL, 0xFFCCCCCC);
+    draw_str(px, buf, colx, mid,          sc, tr,      0xFFCCCCCC);
+    draw_str(px, buf, colx, mid + spread, sc, agestr,  0xFFCCCCCC);
+    y += 8 * bigsc + pad;
+    g_big_y1 = y;
+
+    /* plot-window tabs (or the scrub readout while dragging) */
+    {
+        int colw = cw / PLOT_TABS, rowh = 14 * sc;
+        g_tab_y = y - pad; g_tab_h = rowh + pad;
+        if (scrub) {
+            char ts[16], line[40], gv[12];
+            fmt_hms(g_hist[g_scrub_idx].t, ts, sizeof ts); ts[5] = '\0';
+            fmt_glu(g_hist[g_scrub_idx].glu, gv, sizeof gv);
+            snprintf(line, sizeof line, "%s %s  %s", gv, UNIT_LBL, ts);
+            int lw = str_len(line) * 6 * 2 * sc;
+            int lx = cx + (cw - lw) / 2; if (lx < cx + 2 * sc) lx = cx + 2 * sc;
+            draw_str(px, buf, lx, y, 2 * sc, line, 0xFFFFFFFF);
+        } else {
+            int laby = y + (rowh - 7 * sc) / 2;
+            for (int i = 0; i < PLOT_TABS; i++) {
+                char lab[6];
+                if (PLOT_HRS[i] < 48) snprintf(lab, sizeof lab, "%dH", PLOT_HRS[i]);
+                else                  snprintf(lab, sizeof lab, "%dD", PLOT_HRS[i] / 24);
+                int lw = str_len(lab) * 6 * sc, tabx = cx + i * colw;
+                draw_str(px, buf, tabx + (colw - lw) / 2, laby, sc, lab,
+                         PLOT_HRS[i] == g_plot_hours ? 0xFFFFFFFF : 0xFF888888);
+                g_tab_x[i] = tabx; g_tab_w[i] = colw;
+            }
+        }
+        y += rowh;
+    }
+
+    /* crude 50-300 plot — fixed height in portrait, fills the column in landscape */
+    {
+        int ph = landscape ? (bottom - y - 26 * sc) : 12 * bigsc;
+        if (ph < 20 * sc) ph = 20 * sc;
+        g_plot_x = cx + 2 * sc; g_plot_y = y; g_plot_w = cw - 4 * sc; g_plot_h = ph;
+        static plot_pt pts[NHIST];
+        for (int i = 0; i < g_nhist; i++) { pts[i].t = g_hist[i].t; pts[i].glu = g_hist[i].glu; }
+        int prad = 3 * sc / 2;
+        if      (g_plot_hours >= 168) prad = prad / 2;
+        else if (g_plot_hours >= 72)  prad = prad * 3 / 4;
+        plot_render(px, buf->stride, buf->width, buf->height,
+                    g_plot_x, g_plot_y, g_plot_w, g_plot_h,
+                    pts, g_nhist, realtime_s(), g_plot_hours, prad, white_color,
+                    scrub ? g_scrub_idx : -1, COL_HILITE);
+        y += ph + 9 * sc;
+    }
+
+    /* alarm config row: "ALARM  LOW - 110 +  HIGH - 300 +", justified full-column */
+    {
+        const uint32_t gy = 0xFF888888, wt = 0xFFFFFFFF;
+        int cwid = 6 * sc;
+        char lo[8], hi[8];
+        fmt_glu(g_alarm_low, lo, sizeof lo);
+        fmt_glu(g_alarm_high, hi, sizeof hi);
+        const char *tok[9] = { "ALARM", "LOW", "-", lo, "+", "HIGH", "-", hi, "+" };
+        uint32_t    tcol[9] = { gy, gy, gy, wt, gy, gy, gy, wt, gy };
+        int total = 0; for (int i = 0; i < 9; i++) total += str_len(tok[i]) * cwid;
+        int g = (cw - total) / 10; if (g < cwid) g = cwid;
+        int ax = cx + g, btn = 0;
+        g_al_y = y - 3 * sc; g_al_h = 3 * sc + 7 * sc + pad;
+        for (int i = 0; i < 9; i++) {
+            draw_str(px, buf, ax, y, sc, tok[i], tcol[i]);
+            int tw = str_len(tok[i]) * cwid;
+            if (tok[i][0] == '-' || tok[i][0] == '+') { g_al_x[btn] = ax - g / 2; g_al_w[btn] = tw + g; btn++; }
+            ax += tw + g;
+        }
+        y += 7 * sc + pad;
+    }
+    return y;
+}
+
+/* Right/bottom column: sensor+session panel, stats table, alarm LOW/HIGH banner. */
+static void draw_info(uint32_t *px, const ANativeWindow_Buffer *buf, int cx, int cw, int y, int sc)
+{
+    int x = cx + 2 * sc;
+    const uint32_t col = 0xFFCCCCCC;
+    {
+        dex_session s; driver_get_session(&s);
+        int rssi = 0, have_rssi = 0; long seen = 0;
+        for (int i = 0; i < g_ndevs; i++)
+            if (strcmp(g_devs[i].mac, s.mac) == 0) { rssi = g_devs[i].rssi; seen = g_devs[i].seen_t; have_rssi = 1; break; }
+        char row[64];
+        if (s.bonded) snprintf(row, sizeof row, "STATE   %s (BONDED)", g_status);
+        else          snprintf(row, sizeof row, "STATE   %s  %u ADV", g_status, g_total);
+        draw_str(px, buf, x, y, sc, row, col); y += 9 * sc;
+        snprintf(row, sizeof row, "STORED  %d readings", g_stored);
+        draw_str(px, buf, x, y, sc, row, col); y += 9 * sc;
+        snprintf(row, sizeof row, "STELO   %s %s", PAIR_CODE, s.mac[0] ? s.mac : "--");
+        draw_str(px, buf, x, y, sc, row, col); y += 9 * sc;
+        if (g_model[0]) { snprintf(row, sizeof row, "SW      %s", g_model);
+            draw_str(px, buf, x, y, sc, row, col); y += 9 * sc; }
+        if (g_fw[0]) { snprintf(row, sizeof row, "FW      %s", g_fw);
+            draw_str(px, buf, x, y, sc, row, col); y += 9 * sc; }
+        if (s.have_reading) {
+            long ss = (long)s.session_seconds, left = 15L * 86400 - ss; if (left < 0) left = 0;
+            snprintf(row, sizeof row, "SESSION %ldD %ldH   LEFT %ldD %ldH",
+                     ss / 86400, (ss % 86400) / 3600, left / 86400, (left % 86400) / 3600);
+        } else snprintf(row, sizeof row, "SESSION --");
+        draw_str(px, buf, x, y, sc, row, col); y += 9 * sc;
+        if (g_conn_rssi_t) { char st[16]; fmt_hms(g_conn_rssi_t, st, sizeof st); st[5] = '\0';
+            snprintf(row, sizeof row, "SIGNAL  %d DBM  @ %s", g_conn_rssi, st);
+        } else if (have_rssi) { char st[16]; fmt_hms(seen, st, sizeof st); st[5] = '\0';
+            snprintf(row, sizeof row, "SIGNAL  %d DBM  @ %s", rssi, st);
+        } else snprintf(row, sizeof row, "SIGNAL  --");
+        draw_str(px, buf, x, y, sc, row, col); y += 9 * sc;
+        { char pv[12]; fmt_glu(s.predicted, pv, sizeof pv);
+          snprintf(row, sizeof row, "PRED    %s %s   SEQ %d", pv, UNIT_LBL, s.sequence); }
+        draw_str(px, buf, x, y, sc, row, col); y += 9 * sc;
+    }
+    {
+        static const int WIN[5] = {1, 3, 7, 30, 90};
+        char tc[5][8], ac[5][8], hc[5][8];
+        for (int i = 0; i < 5; i++) {
+            int tir, avg;
+            if (stat_window(WIN[i], &tir, &avg)) {
+                snprintf(tc[i], sizeof tc[i], "%d", tir);
+                fmt_glu(avg, ac[i], sizeof ac[i]);
+                int te = (331 + (2392 * avg) / 1000 + 5) / 10;
+                snprintf(hc[i], sizeof hc[i], "%d.%d", te / 10, te % 10);
+            } else { snprintf(tc[i], sizeof tc[i], "--"); snprintf(ac[i], sizeof ac[i], "--"); snprintf(hc[i], sizeof hc[i], "--"); }
+        }
+        char row[72];
+        y += 7 * sc;
+        snprintf(row, sizeof row, "%-4s%-6s%-6s%-6s%-6s%-6s%s", "", "1D", "3D", "7D", "30D", "90D", "");
+        draw_str(px, buf, x, y, sc, row, 0xFF888888); y += 9 * sc;
+        snprintf(row, sizeof row, "%-4s%-6s%-6s%-6s%-6s%-6s%s", "TIR", tc[0], tc[1], tc[2], tc[3], tc[4], "%");
+        draw_str(px, buf, x, y, sc, row, col); y += 9 * sc;
+        snprintf(row, sizeof row, "%-4s%-6s%-6s%-6s%-6s%-6s%s", "AVG", ac[0], ac[1], ac[2], ac[3], ac[4], UNIT_LBL);
+        draw_str(px, buf, x, y, sc, row, col); y += 9 * sc;
+        snprintf(row, sizeof row, "%-4s%-6s%-6s%-6s%-6s%-6s%s", "A1C", hc[0], hc[1], hc[2], hc[3], hc[4], "%");
+        draw_str(px, buf, x, y, sc, row, col); y += 9 * sc;
+    }
+    {
+        const char *msg = 0; uint32_t c = 0;
+        if (g_disc_alarmed) { msg = "STALE"; c = 0xFF00A0FF; }   /* data too old */
+        else if (realtime_s() - g_cur_time <= 360) {
+            if      (g_cur_glu < g_alarm_low)  { msg = "LOW";  c = 0xFF0000FF; }
+            else if (g_cur_glu > g_alarm_high) { msg = "HIGH"; c = 0xFF0080FF; }
+        }
+        if (msg) {
+            int msc = 5 * sc, w = str_len(msg) * 6 * msc;
+            int mx = cx + (cw - w) / 2; if (mx < cx + 2 * sc) mx = cx + 2 * sc;
+            y += 7 * sc + 9 * sc;
+            draw_str(px, buf, mx, y, msc, msg, c);
+        }
+    }
+}
+
 static void draw(ANativeWindow *win)
 {
     ANativeWindow_Buffer buf;
@@ -483,223 +699,25 @@ static void draw(ANativeWindow *win)
         for (int32_t x = 0; x < buf.width; x++)
             px[y * buf.stride + x] = 0xFF181818;
 
-    int sc = buf.width / (MAX_COLS * 6);
+    int landscape = buf.width > buf.height;
+    /* size text to the COLUMN width so it fits (half-width columns in landscape) */
+    int colw = landscape ? buf.width / 2 : buf.width;
+    int sc = colw / (MAX_COLS * 6);
     if (sc < 1) sc = 1;
+
+    if (g_menu) { draw_settings(px, &buf, sc); ANativeWindow_unlockAndPost(win); return; }
+
     int y = buf.height / 20 + 2 * sc;    /* clear the system status bar */
 
-    /* big current value: the 3-digit glucose at 10x, centred, then the recent
-     * readings (each with its own timestamp + trend). */
     if (g_cur_glu >= 0) {
-        int scrub = (g_scrub_idx >= 0 && g_scrub_idx < g_nhist);
-        long agev = realtime_s() - g_cur_time;
-        int stale = agev > 360;                    /* older than 6 min: not the latest */
-        char big[8]; uint32_t bigcol;
-        /* the big number ALWAYS shows the most recent reading; XXX when stale.
-         * (status now lives in the panel's STATE row, so no banner here) */
-        if (stale) { snprintf(big, sizeof big, "---");           bigcol = 0xFF888888; }
-        else       { snprintf(big, sizeof big, "%d", g_cur_glu); bigcol = glu_color(g_cur_glu); }
-        y += 12 * sc;                              /* padding above big number */
-        int bigsc = sc * 10;
-        int big_w = str_len(big) * 6 * bigsc;
-        /* right column: unit / trend / age stacked beside the number */
-        char tr[8], agestr[12];
-        if (stale) snprintf(tr, sizeof tr, "---");   /* no fresh trend when stale */
-        else       fmt_trend(g_cur_trend, tr, sizeof tr);
-        long a = realtime_s() - g_cur_time; if (a < 0) a = 0;
-        if (a < 600) snprintf(agestr, sizeof agestr, "%ld S", a);
-        else         snprintf(agestr, sizeof agestr, "%ld M", a / 60);
-        int col_w = 5 * 6 * sc;                    /* "MG/DL" is the widest line */
-        int gap = 6 * sc;
-        int bx = (buf.width - (big_w + gap + col_w)) / 2;
-        if (bx < 2 * sc) bx = 2 * sc;
-        draw_str(px, &buf, bx, y, bigsc, big, bigcol);
-        int colx = bx + big_w + gap;
-        int gh = 7 * sc;                           /* glyph height at scale sc */
-        int bh = 8 * bigsc;                        /* big-number height */
-        int mid = y + (bh - gh) / 2;               /* trend at the vertical centre */
-        int spread = (bh - gh) / 4;                /* half the full-height spacing */
-        draw_str(px, &buf, colx, mid - spread, sc, "MG/DL", 0xFFCCCCCC);
-        draw_str(px, &buf, colx, mid,          sc, tr,      0xFFCCCCCC);
-        draw_str(px, &buf, colx, mid + spread, sc, agestr,  0xFFCCCCCC);
-        y += 8 * bigsc + 18 * sc;                  /* big number + padding below (doubled) */
-
-        /* Row above the plot: normally the window tabs; while swiping the plot it
-         * is replaced by the picked datapoint's numbers (2x font, centred). */
-        {
-            int colw = buf.width / PLOT_TABS;
-            int rowh = 14 * sc;                       /* 2x the 7px glyph height */
-            /* extend the tap band up through the empty gap to the big number, so
-             * the whole space above each label is part of the target */
-            g_tab_y = y - 18 * sc; g_tab_h = rowh + 18 * sc;
-            if (scrub) {
-                char ts[16], line[32];
-                fmt_hms(g_hist[g_scrub_idx].t, ts, sizeof ts); ts[5] = '\0';   /* HH:MM */
-                snprintf(line, sizeof line, "%d MG/DL  %s", g_hist[g_scrub_idx].glu, ts);
-                int lw = str_len(line) * 6 * 2 * sc;
-                int lx = (buf.width - lw) / 2; if (lx < 2 * sc) lx = 2 * sc;
-                draw_str(px, &buf, lx, y, 2 * sc, line, 0xFFFFFFFF);
-            } else {
-                int laby = y + (rowh - 7 * sc) / 2;   /* label vertically centred */
-                for (int i = 0; i < PLOT_TABS; i++) {
-                    char lab[6];                       /* <=24h shown in H, larger in D */
-                    if (PLOT_HRS[i] < 48) snprintf(lab, sizeof lab, "%dH", PLOT_HRS[i]);
-                    else                  snprintf(lab, sizeof lab, "%dD", PLOT_HRS[i] / 24);
-                    int lw = str_len(lab) * 6 * sc;
-                    int cx = i * colw + (colw - lw) / 2;   /* centre label in its column */
-                    draw_str(px, &buf, cx, laby, sc, lab,
-                             PLOT_HRS[i] == g_plot_hours ? 0xFFFFFFFF : 0xFF888888);
-                    g_tab_x[i] = i * colw; g_tab_w[i] = colw;   /* whole column is tappable */
-                }
-            }
-            y += rowh;
-        }
-
-        /* crude 50-300 plot, 50% taller than the big number */
-        {
-            int ph = 12 * bigsc;
-            g_plot_x = 2 * sc; g_plot_y = y; g_plot_w = buf.width - 4 * sc; g_plot_h = ph;
-            static plot_pt pts[NHIST];
-            for (int i = 0; i < g_nhist; i++) { pts[i].t = g_hist[i].t; pts[i].glu = g_hist[i].glu; }
-            /* shrink the dots on the dense multi-day windows so they don't merge */
-            int prad = 3 * sc / 2;
-            if      (g_plot_hours >= 168) prad = prad / 2;       /* 7D: 50% smaller */
-            else if (g_plot_hours >= 72)  prad = prad * 3 / 4;   /* 3D: 25% smaller */
-            plot_render(px, buf.stride, buf.width, buf.height,
-                        g_plot_x, g_plot_y, g_plot_w, g_plot_h,
-                        pts, g_nhist, realtime_s(), g_plot_hours, prad, white_color,
-                        scrub ? g_scrub_idx : -1, COL_HILITE);
-            /* (scrub numbers are drawn in the tab row above, not near the dot) */
-            y += ph + 9 * sc;                      /* padding between plot and table */
-        }
-
-        /* alarm config row: "ALARM  LOW - 110 +  HIGH - 300 +" — only the two
-         * numbers are white, everything else gray; the +/- are tap targets. The
-         * nine tokens are justified with equal gaps so the row spans full width
-         * and each +/- has equal space around it (folded into its hit box). */
-        {
-            const uint32_t gy = 0xFF888888, wt = 0xFFFFFFFF;
-            int cw = 6 * sc;
-            char lo[8], hi[8];
-            snprintf(lo, sizeof lo, "%d", g_alarm_low);
-            snprintf(hi, sizeof hi, "%d", g_alarm_high);
-            const char *tok[9] = { "ALARM", "LOW", "-", lo, "+", "HIGH", "-", hi, "+" };
-            uint32_t    tcol[9] = { gy, gy, gy, wt, gy, gy, gy, wt, gy };
-            int total = 0; for (int i = 0; i < 9; i++) total += str_len(tok[i]) * cw;
-            /* 10 equal gaps: one before the first token, one after the last, and
-             * eight between — so every +/- (including the final one) gets the
-             * same breathing room and tap padding, edge included */
-            int gap = (buf.width - total) / 10;
-            if (gap < cw) gap = cw;
-            int ax = gap, btn = 0;
-            /* button tap band runs from just above the text all the way down to
-             * the data table (the doubled blank below is part of the target) */
-            g_al_y = y - 3 * sc; g_al_h = 3 * sc + 7 * sc + 18 * sc;
-            for (int i = 0; i < 9; i++) {
-                draw_str(px, &buf, ax, y, sc, tok[i], tcol[i]);
-                int tw = str_len(tok[i]) * cw;
-                if (tok[i][0] == '-' || tok[i][0] == '+') {   /* button + half-gap each side */
-                    g_al_x[btn] = ax - gap / 2; g_al_w[btn] = tw + gap; btn++;
-                }
-                ax += tw + gap;
-            }
-            y += 7 * sc + 18 * sc;                            /* text + doubled blank line */
-        }
-
-        /* sensor + session info panel (replaces the old recent-readings table) */
-        {
-            dex_session s; driver_get_session(&s);
-            int rssi = 0, have_rssi = 0; long seen = 0;
-            for (int i = 0; i < g_ndevs; i++)
-                if (strcmp(g_devs[i].mac, s.mac) == 0) {
-                    rssi = g_devs[i].rssi; seen = g_devs[i].seen_t; have_rssi = 1; break;
-                }
-            char row[64];
-            const uint32_t col = 0xFFCCCCCC;
-
-            /* when not bonded we're scanning/pairing — show the running advert
-             * count so a dead/stuck scan is obvious (frozen count = scan wedged) */
-            if (s.bonded)
-                snprintf(row, sizeof row, "STATE   %s (BONDED)", g_status);
-            else
-                snprintf(row, sizeof row, "STATE   %s  %u ADV", g_status, g_total);
-            draw_str(px, &buf, 2 * sc, y, sc, row, col); y += 9 * sc;
-
-            snprintf(row, sizeof row, "STORED  %d readings", g_stored);
-            draw_str(px, &buf, 2 * sc, y, sc, row, col); y += 9 * sc;
-
-            snprintf(row, sizeof row, "STELO   %s %s", PAIR_CODE, s.mac[0] ? s.mac : "--");
-            draw_str(px, &buf, 2 * sc, y, sc, row, col); y += 9 * sc;
-
-            if (g_model[0]) { snprintf(row, sizeof row, "SW      %s", g_model);
-                draw_str(px, &buf, 2 * sc, y, sc, row, col); y += 9 * sc; }
-            if (g_fw[0]) { snprintf(row, sizeof row, "FW      %s", g_fw);
-                draw_str(px, &buf, 2 * sc, y, sc, row, col); y += 9 * sc; }
-            /* manufacturer is always Dexcom — read (for the DIS retry gate) but not shown */
-
-            if (s.have_reading) {
-                long ss = (long)s.session_seconds, left = 15L * 86400 - ss; if (left < 0) left = 0;
-                snprintf(row, sizeof row, "SESSION %ldD %ldH   LEFT %ldD %ldH",
-                         ss / 86400, (ss % 86400) / 3600, left / 86400, (left % 86400) / 3600);
-            } else snprintf(row, sizeof row, "SESSION --");
-            draw_str(px, &buf, 2 * sc, y, sc, row, col); y += 9 * sc;
-
-            if (g_conn_rssi_t) {          /* live connection RSSI, with its time */
-                char st[16]; fmt_hms(g_conn_rssi_t, st, sizeof st); st[5] = '\0';
-                snprintf(row, sizeof row, "SIGNAL  %d DBM  @ %s", g_conn_rssi, st);
-            } else if (have_rssi) {       /* fall back to the last advert RSSI */
-                char st[16]; fmt_hms(seen, st, sizeof st); st[5] = '\0';
-                snprintf(row, sizeof row, "SIGNAL  %d DBM  @ %s", rssi, st);
-            } else snprintf(row, sizeof row, "SIGNAL  --");
-            draw_str(px, &buf, 2 * sc, y, sc, row, col); y += 9 * sc;
-
-            snprintf(row, sizeof row, "PRED    %d MG/DL   SEQ %d", s.predicted, s.sequence);
-            draw_str(px, &buf, 2 * sc, y, sc, row, col); y += 9 * sc;
-        }
-
-        /* blank line, then TIR / AVG over 3/7/30/90 days (O(90) daily buckets) */
-        {
-            static const int WIN[5] = {1, 3, 7, 30, 90};
-            char tc[5][8], ac[5][8], hc[5][8];
-            for (int i = 0; i < 5; i++) {
-                int tir, avg;
-                if (stat_window(WIN[i], &tir, &avg)) {
-                    snprintf(tc[i], sizeof tc[i], "%d", tir);   /* unit shown in its own column */
-                    snprintf(ac[i], sizeof ac[i], "%d", avg);
-                    /* GMI (glucose management indicator) = 3.31 + 0.02392*avg */
-                    int te = (331 + (2392 * avg) / 1000 + 5) / 10;   /* A1C in tenths % */
-                    snprintf(hc[i], sizeof hc[i], "%d.%d", te / 10, te % 10);
-                } else {
-                    snprintf(tc[i], sizeof tc[i], "--");
-                    snprintf(ac[i], sizeof ac[i], "--");
-                    snprintf(hc[i], sizeof hc[i], "--");
-                }
-            }
-            char row[72];
-            y += 7 * sc;                          /* one blank row (matches the 9sc gap) */
-            snprintf(row, sizeof row, "%-4s%-6s%-6s%-6s%-6s%-6s%s", "", "1D", "3D", "7D", "30D", "90D", "");
-            draw_str(px, &buf, 2 * sc, y, sc, row, 0xFF888888); y += 9 * sc;
-            snprintf(row, sizeof row, "%-4s%-6s%-6s%-6s%-6s%-6s%s", "TIR", tc[0], tc[1], tc[2], tc[3], tc[4], "%");
-            draw_str(px, &buf, 2 * sc, y, sc, row, 0xFFCCCCCC); y += 9 * sc;
-            snprintf(row, sizeof row, "%-4s%-6s%-6s%-6s%-6s%-6s%s", "AVG", ac[0], ac[1], ac[2], ac[3], ac[4], "MG/DL");
-            draw_str(px, &buf, 2 * sc, y, sc, row, 0xFFCCCCCC); y += 9 * sc;
-            snprintf(row, sizeof row, "%-4s%-6s%-6s%-6s%-6s%-6s%s", "A1C", hc[0], hc[1], hc[2], hc[3], hc[4], "%");
-            draw_str(px, &buf, 2 * sc, y, sc, row, 0xFFCCCCCC); y += 9 * sc;
-        }
-
-        /* alarm trigger: when the current (fresh) reading is out of the set
-         * range, announce it in large centred letters below the stats table */
-        if (realtime_s() - g_cur_time <= 360) {
-            const char *msg = 0; uint32_t c = 0;
-            if      (g_cur_glu < g_alarm_low)  { msg = "LOW";  c = 0xFF0000FF; }
-            else if (g_cur_glu > g_alarm_high) { msg = "HIGH"; c = 0xFF0080FF; }
-            if (msg) {
-                int msc = 5 * sc;                          /* large letters */
-                int w = str_len(msg) * 6 * msc;
-                int mx = (buf.width - w) / 2; if (mx < 2 * sc) mx = 2 * sc;
-                y += 7 * sc + 9 * sc;                      /* doubled blank above the word */
-                draw_str(px, &buf, mx, y, msc, msg, c);
-                y += 8 * msc;
-            }
+        if (landscape) {                       /* two columns with a 2-char gutter */
+            int gw = 2 * 6 * sc;
+            int cwid = (buf.width - gw) / 2;
+            draw_glucose(px, &buf, 0, cwid, y, sc, buf.height);
+            draw_info(px, &buf, cwid + gw, buf.width - cwid - gw, y, sc);
+        } else {                               /* portrait: stacked, full width */
+            y = draw_glucose(px, &buf, 0, buf.width, y, sc, 0);
+            draw_info(px, &buf, 0, buf.width, y, sc);
         }
     }
 
@@ -877,6 +895,48 @@ static void set_status(const char *s)
     update_screen();
 }
 
+/* Re-evaluate the alarm against the latest fresh reading and current thresholds.
+ * Chime+vibrate once on the transition from NOT-alarmed to alarmed — whether that
+ * transition comes from a new glucose value or from moving a threshold. Never
+ * re-fires while already alarmed (low<->high is not a new entry); silences when
+ * the value returns in range. Safe to call on every reading or threshold tap. */
+static void alarm_reeval(void)
+{
+    int fresh = (g_cur_glu >= 0 && realtime_s() - g_cur_time <= 360);
+    int zone  = !fresh ? 0
+              : (g_cur_glu < g_alarm_low)  ? 1
+              : (g_cur_glu > g_alarm_high) ? 2 : 0;
+    int was_alarmed = (g_alarm_state != 0);
+    if (!was_alarmed && zone) {            /* not-alarmed -> alarmed: fire once */
+        g_alarm_sounding = 1;
+        dexble_alarm(zone == 2, g_sound_on, g_vib_on);
+    } else if (was_alarmed && !zone) {     /* back in range: stop */
+        if (g_alarm_sounding) { g_alarm_sounding = 0; dexble_alarm_silence(); }
+    }
+    g_alarm_state = zone;
+}
+
+/* Stale-data ("DISCONNECT") alarm: fire when the newest reading is older than the
+ * chosen threshold. A freshly opened app gets a grace period equal to the
+ * threshold (data may be stale until the first sync). Evaluated on the 1 Hz timer
+ * because it's the ABSENCE of new data that triggers it. */
+static void disc_reeval(void)
+{
+    if (g_disc == 0) {   /* OFF */
+        if (g_disc_alarmed) { g_disc_alarmed = 0; if (g_alarm_sounding) { g_alarm_sounding = 0; dexble_alarm_silence(); } }
+        return;
+    }
+    long thr = (long)DISC_MIN[g_disc & 3] * 60, now = realtime_s();
+    int grace = (now - g_launch_t < thr);
+    int stale = !grace && (g_cur_glu < 0 || now - g_cur_time > thr);
+    if (stale && !g_disc_alarmed) {
+        g_disc_alarmed = 1; g_alarm_sounding = 1;
+        dexble_alarm(0, g_sound_on, g_vib_on);
+    } else if (!stale && g_disc_alarmed) {
+        g_disc_alarmed = 0; if (g_alarm_sounding) { g_alarm_sounding = 0; dexble_alarm_silence(); }
+    }
+}
+
 /* --- hooks called by the BLE driver (dexble.c) --- */
 void stealo_status(const char *s) { set_status(s); }
 /* current reading from the 4e stream */
@@ -894,17 +954,7 @@ void stealo_glucose(int mg_dl, int trend, int age_s)
     snprintf(g_glucose, sizeof g_glucose, "GLUCOSE %d  TR %d", mg_dl, trend);
     LOGI("glucose %d mg/dL trend %d age %d", mg_dl, trend, age_s);
 
-    /* Edge-triggered audible/vibrating alarm: sound only on the transition INTO
-     * an out-of-range zone (not on every out-of-range reading), and stop when a
-     * reading returns to range. A press anywhere also silences (see on_input). */
-    if (isnew) {
-        int st = (g_cur_glu < g_alarm_low) ? 1 : (g_cur_glu > g_alarm_high) ? 2 : 0;
-        if (st != g_alarm_state) {
-            g_alarm_state = st;
-            if (st) { g_alarm_sounding = 1; dexble_alarm(st == 2); }
-            else if (g_alarm_sounding) { g_alarm_sounding = 0; dexble_alarm_silence(); }
-        }
-    }
+    alarm_reeval();   /* chime on entering the alarmed state (see alarm_reeval) */
     update_screen();
     draw(g_win);                 /* force a repaint even if the text line is unchanged */
 
@@ -1019,6 +1069,128 @@ static void alarm_load(void)
     if (lo > 0) g_alarm_low = lo;
     if (hi > 0) g_alarm_high = hi;
 }
+/* settings menu state: "sound vib landscape\n" */
+static void settings_save(void)
+{
+    int fd = open(g_settings_path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0) return;
+    char b[48]; int n = snprintf(b, sizeof b, "%d %d %d %d %d\n",
+                                 g_sound_on, g_vib_on, g_orient, g_units, g_disc);
+    if (write(fd, b, n) != n) {}
+    close(fd);
+}
+static void settings_load(void)
+{
+    int fd = open(g_settings_path, O_RDONLY, 0);
+    if (fd < 0) return;
+    char b[48]; int n = read(fd, b, sizeof b - 1); close(fd);
+    if (n <= 0) return; b[n] = 0;
+    int v[5] = { g_sound_on, g_vib_on, g_orient, g_units, g_disc }; char *q = b;
+    for (int i = 0; i < 5; i++) {
+        while (*q == ' ') q++;
+        if (*q < '0' || *q > '9') break;
+        int x = 0; while (*q >= '0' && *q <= '9') x = x * 10 + (*q++ - '0');
+        v[i] = x;
+    }
+    g_sound_on = v[0]; g_vib_on = v[1]; g_orient = v[2] & 3;
+    g_units = v[3] ? 1 : 0; g_disc = (v[4] >= 0 && v[4] < 4) ? v[4] : 0;
+}
+/* --- settings-menu system ops via Ble.java (main thread; g_act->env valid) --- */
+static void sys_set_orientation(int mode)
+{
+    if (!g_act || !m_set_orient) return;
+    JNIEnv *e = g_act->env;
+    (*e)->CallStaticVoidMethod(e, g_ble, m_set_orient, g_act->clazz, (jint)mode);
+}
+static int sys_perm_granted(const char *perm)
+{
+    if (!g_act || !m_perm_granted) return 0;
+    JNIEnv *e = g_act->env;
+    jstring p = (*e)->NewStringUTF(e, perm);
+    jboolean r = (*e)->CallStaticBooleanMethod(e, g_ble, m_perm_granted, g_act->clazz, p);
+    (*e)->DeleteLocalRef(e, p);
+    return r;
+}
+static void sys_request_perm(const char *perm)
+{
+    if (!g_act || !m_req_perm) return;
+    JNIEnv *e = g_act->env;
+    jstring p = (*e)->NewStringUTF(e, perm);
+    (*e)->CallStaticVoidMethod(e, g_ble, m_req_perm, g_act->clazz, p);
+    (*e)->DeleteLocalRef(e, p);
+}
+static void sys_open_settings(void)   /* app details page: grant or revoke anything */
+{
+    if (!g_act || !m_open_settings) return;
+    JNIEnv *e = g_act->env;
+    (*e)->CallStaticVoidMethod(e, g_ble, m_open_settings, g_act->clazz);
+}
+
+/* ---- settings menu: portrait table, name left / value right, each row a tap
+ * box + action id. actions: 0 orientation, 1 sound, 2 vibration, 10+i perm i,
+ * 99 close. Font is the regular sc size; rows are full-width tap targets. ---- */
+static void menu_add_box(int x, int y, int w, int h, int action)
+{
+    if (g_menu_n >= MENU_MAX) return;
+    g_menu_items[g_menu_n].x = x; g_menu_items[g_menu_n].y = y;
+    g_menu_items[g_menu_n].w = w; g_menu_items[g_menu_n].h = h;
+    g_menu_items[g_menu_n].action = action; g_menu_n++;
+}
+static void menu_row(uint32_t *px, const ANativeWindow_Buffer *buf, int y, int sc, int lh,
+                     const char *name, const char *value, uint32_t valcol, int action)
+{
+    int x = 4 * sc, rx = buf->width - 4 * sc;
+    draw_str(px, buf, x, y, sc, name, 0xFFCCCCCC);
+    int vw = str_len(value) * 6 * sc;
+    draw_str(px, buf, rx - vw, y, sc, value, valcol);
+    menu_add_box(0, y - 3 * sc, buf->width, lh, action);   /* whole row is tappable */
+}
+static void draw_settings(uint32_t *px, const ANativeWindow_Buffer *buf, int sc)
+{
+    int tsc = 2 * sc, lh = 16 * sc;   /* generous pitch: a blank line between rows */
+    int x = 4 * sc, rx = buf->width - 4 * sc;
+    int y = buf->height / 20 + 8 * sc;
+    g_menu_n = 0;
+
+    /* title with a right-aligned X to close */
+    draw_str(px, buf, x, y, tsc, "SETTINGS", 0xFFFFFFFF);
+    int xw = 6 * tsc, xx = rx - xw;
+    draw_str(px, buf, xx, y, tsc, "X", 0xFFFFFFFF);
+    menu_add_box(0, y - 3 * sc, buf->width, 8 * tsc, 99);   /* whole title row closes */
+    y += 2 * lh;
+
+    draw_str(px, buf, x, y, sc, "DISPLAY", 0xFF888888); y += lh;
+    menu_row(px, buf, y, sc, lh, "ORIENTATION", ORIENT_LBL[g_orient & 3], 0xFFFFFFFF, 0); y += lh;
+    menu_row(px, buf, y, sc, lh, "UNITS",       g_units ? "MMOL/L" : "MG/DL", 0xFFFFFFFF, 3); y += 2 * lh;
+
+    draw_str(px, buf, x, y, sc, "ALARM", 0xFF888888); y += lh;
+    menu_row(px, buf, y, sc, lh, "SOUND",      g_sound_on ? "ON" : "OFF", 0xFFFFFFFF, 1); y += lh;
+    menu_row(px, buf, y, sc, lh, "VIBRATION",  g_vib_on ? "ON" : "OFF",   0xFFFFFFFF, 2); y += lh;
+    menu_row(px, buf, y, sc, lh, "DISCONNECT", DISC_LBL[g_disc & 3],      0xFFFFFFFF, 4); y += 2 * lh;
+
+    draw_str(px, buf, x, y, sc, "PERMISSIONS", 0xFF888888); y += lh;
+    for (int i = 0; i < NPERMS; i++) {
+        int g = sys_perm_granted(PERMS[i]);
+        menu_row(px, buf, y, sc, lh, PERM_LBL[i], g ? "GRANTED" : "DENIED",
+                 g ? 0xFF33FF88 : 0xFF4466FF, 10 + i);
+        y += lh;
+    }
+}
+static void menu_action(int action)
+{
+    if (action == 0)      { g_orient = (g_orient + 1) & 3; settings_save(); }  /* applied on close */
+    else if (action == 1) { g_sound_on = !g_sound_on; settings_save(); }
+    else if (action == 2) { g_vib_on   = !g_vib_on;   settings_save(); }
+    else if (action == 3) { g_units    = !g_units;    settings_save(); }
+    else if (action == 4) { g_disc     = (g_disc + 1) & 3; settings_save(); }
+    else if (action >= 10 && action < 10 + NPERMS) {
+        /* denied -> request dialog; granted -> app settings (only place to revoke) */
+        if (sys_perm_granted(PERMS[action - 10])) sys_open_settings();
+        else sys_request_perm(PERMS[action - 10]);
+    }
+    else if (action == 99) { g_menu = 0; sys_set_orientation(g_orient); }   /* apply chosen orient */
+    if (g_win) draw(g_win);
+}
 /* which alarm +/- button (0:LOW- 1:LOW+ 2:HIGH- 3:HIGH+) is under (tx,ty), or -1 */
 static int alarm_button_at(int tx, int ty)
 {
@@ -1038,6 +1210,7 @@ static void alarm_adjust(int i)
         if (i < 2) g_alarm_low = g_alarm_high; else g_alarm_high = g_alarm_low;
     }
     alarm_save();
+    alarm_reeval();   /* a threshold move can itself enter/leave the alarmed state */
 }
 
 /* an older reading recovered via backfill: store it, place it in history, but
@@ -1080,7 +1253,12 @@ static void start_scan(ANativeActivity *a)
     }
     g_scanning = 1;
     LOGI("scanning (receive-only)");
-    set_status("SCANNING");
+    /* only surface SCANNING before we're operational; once paired/streaming the
+     * driver's own status (WAITING/CONNECTED/...) is the meaningful one and the
+     * background scan must not mask it */
+    dex_session s; driver_get_session(&s);
+    if (!s.paired && !s.have_reading)
+        set_status("SCANNING");
 }
 
 static void stop_scan(ANativeActivity *a)
@@ -1093,7 +1271,9 @@ static void stop_scan(ANativeActivity *a)
     if ((*env)->ExceptionCheck(env))
         (*env)->ExceptionClear(env);
     g_scanning = 0;
-    set_status("PAUSED");
+    /* don't surface "PAUSED": stopping the background scan is an internal detail
+     * (it happens on pause and on every orientation flip); the driver's own
+     * connection status stays the meaningful thing to show */
 }
 
 /* --- input: drain the queue so the ANR watchdog stays fed --- */
@@ -1118,6 +1298,7 @@ static int on_timer(int fd, int events, void *data)
     uint64_t ticks;
     read(fd, &ticks, sizeof ticks);   /* single read clears the expiration count */
     if (g_al_held >= 0) alarm_adjust(g_al_held);
+    disc_reeval();                     /* stale-data alarm depends on elapsed time */
     if (g_win) draw(g_win);
     return 1;
 }
@@ -1135,6 +1316,18 @@ static int on_input(int fd, int events, void *data)
             int action = AMotionEvent_getAction(ev) & AMOTION_EVENT_ACTION_MASK;
             int tx = (int)AMotionEvent_getX(ev, 0);
             int ty = (int)AMotionEvent_getY(ev, 0);
+            /* settings menu is modal: while open it absorbs all input, and a tap
+             * on a row runs that row's action */
+            if (g_menu) {
+                if (action == AMOTION_EVENT_ACTION_DOWN)
+                    for (int i = 0; i < g_menu_n; i++)
+                        if (tx >= g_menu_items[i].x && tx < g_menu_items[i].x + g_menu_items[i].w &&
+                            ty >= g_menu_items[i].y && ty < g_menu_items[i].y + g_menu_items[i].h) {
+                            menu_action(g_menu_items[i].action); break;
+                        }
+                AInputQueue_finishEvent(q, ev, 1);
+                continue;
+            }
             /* any press anywhere silences a sounding alarm first, and that press
              * does nothing else (so you can't accidentally change a tab/threshold
              * while silencing) */
@@ -1143,11 +1336,22 @@ static int on_input(int fd, int events, void *data)
                 AInputQueue_finishEvent(q, ev, 1);
                 continue;
             }
+            /* a tap in the big-number band opens the settings menu (always portrait) */
+            if (action == AMOTION_EVENT_ACTION_DOWN && ty >= g_big_y0 && ty < g_big_y1) {
+                g_menu = 1; sys_set_orientation(0); if (g_win) draw(g_win);
+                AInputQueue_finishEvent(q, ev, 1);
+                continue;
+            }
             int in_plot = tx >= g_plot_x && tx < g_plot_x + g_plot_w &&
                           ty >= g_plot_y && ty < g_plot_y + g_plot_h;
-            if ((action == AMOTION_EVENT_ACTION_DOWN || action == AMOTION_EVENT_ACTION_MOVE) && in_plot) {
-                /* Press-and-hold: highlight the datapoint nearest the finger.
-                 * Average the current sample with the batched historical ones so
+            /* A drag begins on a press inside the plot; once begun, keep scrubbing
+             * for every MOVE — even when the finger leaves the plot rectangle —
+             * using its X position (plot_hit picks by time/X only). */
+            int begin  = (action == AMOTION_EVENT_ACTION_DOWN && in_plot);
+            int cont   = (action == AMOTION_EVENT_ACTION_MOVE && g_scrubbing);
+            if (begin || cont) {
+                g_scrubbing = 1;
+                /* Average the current sample with the batched historical ones so
                  * the pick tracks the centre of the contact, not a jittery edge. */
                 unsigned long hs = AMotionEvent_getHistorySize(ev);
                 long ax = tx, ay = ty, n = 1;
@@ -1172,6 +1376,7 @@ static int on_input(int fd, int events, void *data)
                     handled = 1;
                 }
             } else if (action == AMOTION_EVENT_ACTION_UP || action == AMOTION_EVENT_ACTION_CANCEL) {
+                g_scrubbing = 0;
                 if (g_al_held >= 0) {               /* release stops the auto-repeat */
                     g_al_held = -1; timer_set(1000, 1000); handled = 1;
                 } else if (g_scrub_idx >= 0) {      /* release clears the highlight */
@@ -1221,6 +1426,7 @@ void ANativeActivity_onCreate(ANativeActivity *activity, void *saved, size_t sav
     JNIEnv *env = activity->env;
 
     g_act = activity;
+    g_launch_t = realtime_s();          /* stale-alarm grace starts now */
 
     /* local timezone offset (seconds), for on-screen timestamps */
     {
@@ -1268,11 +1474,17 @@ void ANativeActivity_onCreate(ANativeActivity *activity, void *saved, size_t sav
     g_scan = (*env)->GetStaticMethodID(env, g_ble, "scan",
                                        "(Landroid/content/Context;)Ljava/lang/String;");
     g_stop = (*env)->GetStaticMethodID(env, g_ble, "stop", "()V");
+    m_set_orient   = (*env)->GetStaticMethodID(env, g_ble, "setOrientation", "(Landroid/content/Context;I)V");
+    m_perm_granted = (*env)->GetStaticMethodID(env, g_ble, "permGranted", "(Landroid/content/Context;Ljava/lang/String;)Z");
+    m_req_perm     = (*env)->GetStaticMethodID(env, g_ble, "requestPerm", "(Landroid/content/Context;Ljava/lang/String;)V");
+    m_open_settings = (*env)->GetStaticMethodID(env, g_ble, "openAppSettings", "(Landroid/content/Context;)V");
 
     /* wire up the BLE protocol driver (registers its own Ble callbacks) */
     dexble_init(activity->internalDataPath ? activity->internalDataPath : "/data/local/tmp");
     if (!dexble_register(env, g_ble, activity->clazz))
         LOGI("dexble_register failed");
+    /* Alarm class must come through the app's own classloader (see find_app_class) */
+    dexble_set_alarm(env, find_app_class(activity, "com.jk.stealo.Alarm"));
 
     /* persistent reading log: remember our own datapoints across restarts.
      * Internal storage; the app is debuggable, so retrieve with
@@ -1289,10 +1501,15 @@ void ANativeActivity_onCreate(ANativeActivity *activity, void *saved, size_t sav
         int m = 0; for (; dir[m] && m < 230; m++) g_alarm_path[m] = dir[m];
         const char *h = "/alarm.cfg"; for (int j = 0; h[j]; j++) g_alarm_path[m++] = h[j];
         g_alarm_path[m] = 0;
+        int p = 0; for (; dir[p] && p < 230; p++) g_settings_path[p] = dir[p];
+        const char *sf = "/settings.cfg"; for (int j = 0; sf[j]; j++) g_settings_path[p++] = sf[j];
+        g_settings_path[p] = 0;
         store_load();
         stat_load();
         info_load();
         alarm_load();
+        settings_load();
+        sys_set_orientation(g_orient);      /* restore last-chosen orientation */
         g_stored = store_count();
         LOGI("reading log: %s (%d in memory, %d stored)", g_store_path, g_nhist, g_stored);
     }

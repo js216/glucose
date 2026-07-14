@@ -26,7 +26,8 @@
   <application android:label="Stealo"
                android:debuggable="true"
                android:theme="@android:style/Theme.NoTitleBar">
-    <activity android:name="android.app.NativeActivity" android:exported="true">
+    <activity android:name="android.app.NativeActivity" android:exported="true"
+              android:configChanges="orientation|screenSize|screenLayout|keyboardHidden">
       <meta-data android:name="android.app.lib_name" android:value="stealo"/>
       <intent-filter>
         <action android:name="android.intent.action.MAIN"/>

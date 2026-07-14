@@ -2,7 +2,7 @@
 CLANG     := /usr/lib/llvm-19/bin/clang
 STRIP     := /usr/lib/llvm-19/bin/llvm-strip
 TARGET    := aarch64-linux-android29
-JNI_INC   := -I. -I/usr/lib/jvm/default-java/include -I/usr/lib/jvm/default-java/include/linux
+JNI_INC   := -Isrc -I/usr/lib/jvm/default-java/include -I/usr/lib/jvm/default-java/include/linux
 CFLAGS    := -Os -ffreestanding -fno-stack-protector -fno-unwind-tables \
              -fno-asynchronous-unwind-tables -fvisibility=hidden $(JNI_INC)
 FRAMEWORK := /usr/share/android-framework-res/framework-res.apk
@@ -21,14 +21,14 @@ STUBS := build/stub/libc.so build/stub/libandroid.so build/stub/liblog.so
 
 all: $(APK)
 
-build/stub/lib%.so: stub_%.c
+build/stub/lib%.so: src/stub_%.c
 	@mkdir -p $(@D)
 	$(CLANG) --target=$(TARGET) -shared -nostdlib -fuse-ld=lld \
 	    -Wl,-soname,lib$*.so -o $@ $<
 
 # native sources: UI/JNI core, BLE transport, protocol driver, self-contained crypto
-SRC := main.c plot.c dexble.c dexdriver.c \
-       dexauth.c dexdata.c p256.c sha256.c aes.c
+SRC := src/main.c src/plot.c src/dexble.c src/dexdriver.c \
+       src/dexauth.c src/dexdata.c src/p256.c src/sha256.c src/aes.c
 
 $(LIB): $(SRC) $(STUBS)
 	@mkdir -p $(@D)
@@ -36,8 +36,8 @@ $(LIB): $(SRC) $(STUBS)
 	    -Wl,--no-undefined -Lbuild/stub -lc -landroid -llog -o $@ $(SRC)
 	$(STRIP) $@
 
-build/classes/com/jk/stealo/Ble.class: Ble.java StealoService.java Alarm.java
-	javac $(JAVACFLAGS) -d build/classes Ble.java StealoService.java Alarm.java
+build/classes/com/jk/stealo/Ble.class: src/Ble.java src/StealoService.java src/Alarm.java
+	javac $(JAVACFLAGS) -d build/classes src/Ble.java src/StealoService.java src/Alarm.java
 
 $(DEX): build/classes/com/jk/stealo/Ble.class
 	@mkdir -p $(@D)
