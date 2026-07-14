@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+          package="com.jk.stealo"
+          android:versionCode="1" android:versionName="1.0">
+  <uses-sdk android:minSdkVersion="29" android:targetSdkVersion="34"/>
+
+  <!-- Android 12+ (API 31+): scanning never used to derive location -->
+  <uses-permission android:name="android.permission.BLUETOOTH_SCAN"
+                   android:usesPermissionFlags="neverForLocation"/>
+  <uses-permission android:name="android.permission.BLUETOOTH_CONNECT"/>
+  <!-- pre-12 devices: legacy equivalents -->
+  <uses-permission android:name="android.permission.BLUETOOTH"
+                   android:maxSdkVersion="30"/>
+  <uses-permission android:name="android.permission.BLUETOOTH_ADMIN"
+                   android:maxSdkVersion="30"/>
+  <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION"
+                   android:maxSdkVersion="30"/>
+  <!-- keep BLE alive in the background via a foreground service -->
+  <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+  <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE"/>
+  <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+  <uses-permission android:name="android.permission.VIBRATE"/>
+  <!-- keep the process alive through Doze (user grants via the system dialog) -->
+  <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS"/>
+
+  <application android:label="Stealo"
+               android:debuggable="true"
+               android:theme="@android:style/Theme.NoTitleBar">
+    <activity android:name="android.app.NativeActivity" android:exported="true">
+      <meta-data android:name="android.app.lib_name" android:value="stealo"/>
+      <intent-filter>
+        <action android:name="android.intent.action.MAIN"/>
+        <category android:name="android.intent.category.LAUNCHER"/>
+      </intent-filter>
+    </activity>
+    <service android:name=".StealoService"
+             android:foregroundServiceType="connectedDevice"
+             android:exported="false"/>
+  </application>
+</manifest>

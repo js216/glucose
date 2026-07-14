@@ -1,0 +1,4 @@
+*.swp
+.claude
+build
+tmp

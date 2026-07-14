@@ -1,0 +1,224 @@
+/* Dumb pipe to the Android BLE APIs: exposes primitives, interprets nothing.
+ * All protocol meaning lives on the C side (dexble.c). Java only:
+ *   - scans and reports advertisements,
+ *   - connects / discovers / subscribes / writes on request,
+ *   - serialises GATT operations (Android allows one in flight at a time),
+ *   - forwards connection events, notifications and write-acks to native.
+ */
+package com.jk.stealo;
+
+import android.bluetooth.BluetoothAdapter;
+import android.bluetooth.BluetoothDevice;
+import android.bluetooth.BluetoothGatt;
+import android.bluetooth.BluetoothGattCallback;
+import android.bluetooth.BluetoothGattCharacteristic;
+import android.bluetooth.BluetoothGattDescriptor;
+import android.bluetooth.BluetoothGattService;
+import android.bluetooth.BluetoothManager;
+import android.bluetooth.BluetoothProfile;
+import android.bluetooth.le.BluetoothLeScanner;
+import android.bluetooth.le.ScanCallback;
+import android.bluetooth.le.ScanResult;
+import android.bluetooth.le.ScanSettings;
+import android.content.Context;
+import android.util.Log;
+
+import java.util.ArrayDeque;
+import java.util.UUID;
+
+public final class Ble {
+    private static final String TAG = "stealo";
+    private static final UUID CCCD =
+        UUID.fromString("00002902-0000-1000-8000-00805f9b34fb");
+
+    public static int ping() { return 42; }
+
+    /* start the foreground service so BLE keeps running in the background, and
+     * ask to be exempted from battery optimisation so Doze can't kill us */
+    public static void startService(Context ctx) {
+        StealoService.start(ctx);
+        StealoService.requestNoBatteryOpt(ctx);
+    }
+
+    /* ---- Java -> C callbacks (bound via RegisterNatives in dexble.c) ---- */
+    static native void onAdvert(String name, String mac, int rssi);
+    static native void onConnected();
+    static native void onDisconnected(int status);
+    static native void onNotify(String uuid, byte[] data);
+    static native void onWritten(String uuid, int status);
+    static native void onRssi(int rssi);
+    static native void onRead(String uuid, byte[] data);
+
+    private static BluetoothLeScanner scanner;
+    private static ScanCallback scanCb;
+    private static BluetoothGatt gatt;
+
+    /* GATT operations must be serialised; queue Runnables, run one at a time. */
+    private static final ArrayDeque<Runnable> ops = new ArrayDeque<>();
+    private static boolean busy;
+
+    private static synchronized void enqueue(Runnable r) { ops.add(r); pump(); }
+    private static synchronized void pump() {
+        if (busy || ops.isEmpty() || gatt == null) return;
+        busy = true;
+        Runnable r = ops.poll();
+        try { r.run(); } catch (Throwable t) { Log.i(TAG, "op: " + t); done(); }
+    }
+    private static synchronized void done() { busy = false; pump(); }
+
+    /* ---- scanning (unchanged pipe) ---- */
+    public static String scan(Context ctx) {
+        try {
+            BluetoothManager bm =
+                (BluetoothManager) ctx.getSystemService(Context.BLUETOOTH_SERVICE);
+            BluetoothAdapter ad = (bm == null) ? null : bm.getAdapter();
+            if (ad == null)      return "NO BLUETOOTH";
+            if (!ad.isEnabled()) return "BLUETOOTH OFF";
+            scanner = ad.getBluetoothLeScanner();
+            if (scanner == null) return "NO LE SCANNER";
+            scanCb = new ScanCallback() {
+                @Override public void onScanResult(int type, ScanResult r) {
+                    String name = (r.getScanRecord() == null)
+                                ? null : r.getScanRecord().getDeviceName();
+                    onAdvert(name == null ? "" : name,
+                             r.getDevice().getAddress(), r.getRssi());
+                }
+                @Override public void onScanFailed(int err) { Log.i(TAG, "scan failed: " + err); }
+            };
+            scanner.startScan(null,
+                new ScanSettings.Builder()
+                    .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY).build(), scanCb);
+            return null;
+        } catch (Throwable t) { return t.getClass().getSimpleName(); }
+    }
+
+    public static void stop() {
+        try { if (scanner != null && scanCb != null) scanner.stopScan(scanCb); }
+        catch (Throwable t) { Log.i(TAG, "stop: " + t); }
+        scanCb = null;
+    }
+
+    /* ---- connect / GATT ---- */
+    public static String connect(Context ctx, String mac) {
+        try {
+            BluetoothManager bm =
+                (BluetoothManager) ctx.getSystemService(Context.BLUETOOTH_SERVICE);
+            BluetoothAdapter ad = (bm == null) ? null : bm.getAdapter();
+            if (ad == null) return "NO BLUETOOTH";
+            BluetoothDevice dev = ad.getRemoteDevice(mac);
+            synchronized (Ble.class) { ops.clear(); busy = false; }
+            /* autoConnect=true: connect when the sensor next advertises rather than
+             * failing immediately (status 62). Robust for periodic CGM advertising
+             * and gentle on the sensor battery (passive wait, no connect storms). */
+            gatt = dev.connectGatt(ctx.getApplicationContext(), true, cb, BluetoothDevice.TRANSPORT_LE);
+            return gatt == null ? "CONNECT NULL" : null;
+        } catch (Throwable t) { return t.getClass().getSimpleName(); }
+    }
+
+    public static void disconnect() {
+        try { if (gatt != null) { gatt.disconnect(); gatt.close(); } }
+        catch (Throwable t) { Log.i(TAG, "disc: " + t); }
+        synchronized (Ble.class) { gatt = null; ops.clear(); busy = false; }
+    }
+
+    private static BluetoothGattCharacteristic find(String uuid) {
+        if (gatt == null) return null;
+        UUID u = UUID.fromString(uuid);
+        for (BluetoothGattService s : gatt.getServices()) {
+            BluetoothGattCharacteristic c = s.getCharacteristic(u);
+            if (c != null) return c;
+        }
+        return null;
+    }
+
+    /* Enable notifications (indicate=false) or indications (indicate=true). */
+    public static void subscribe(final String uuid, final boolean indicate) {
+        enqueue(new Runnable() { public void run() {
+            Log.i(TAG, "op subscribe " + uuid + (indicate ? " IND" : " NOT"));
+            BluetoothGattCharacteristic c = find(uuid);
+            if (c == null) { Log.i(TAG, "  char not found"); onWritten(uuid, -1); done(); return; }
+            gatt.setCharacteristicNotification(c, true);
+            BluetoothGattDescriptor d = c.getDescriptor(CCCD);
+            if (d == null) { Log.i(TAG, "  no CCCD"); onWritten(uuid, -1); done(); return; }
+            d.setValue(indicate ? BluetoothGattDescriptor.ENABLE_INDICATION_VALUE
+                                : BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE);
+            gatt.writeDescriptor(d);   /* completes in onDescriptorWrite */
+        }});
+    }
+
+    /* Read the live connection RSSI; result arrives in onReadRemoteRssi.
+     * This only reads packets already being received — nothing is sent to the
+     * sensor, so it costs the sensor no battery. */
+    public static void readRssi() {
+        enqueue(new Runnable() { public void run() {
+            if (gatt == null || !gatt.readRemoteRssi()) done();
+        }});
+    }
+
+    /* Read a characteristic (e.g. Device Information Service strings); the value
+     * arrives in onCharacteristicRead and is forwarded to native via onRead. */
+    public static void read(final String uuid) {
+        enqueue(new Runnable() { public void run() {
+            BluetoothGattCharacteristic c = find(uuid);
+            if (c == null) { Log.i(TAG, "op read " + uuid + " -> char not found"); onRead(uuid, new byte[0]); done(); return; }
+            Log.i(TAG, "op read " + uuid);
+            if (!gatt.readCharacteristic(c)) { Log.i(TAG, "  readCharacteristic false"); onRead(uuid, new byte[0]); done(); }
+        }});
+    }
+
+    /* Write a characteristic; noResponse selects WRITE_TYPE_NO_RESPONSE. */
+    public static void write(final String uuid, final byte[] data, final boolean noResponse) {
+        enqueue(new Runnable() { public void run() {
+            Log.i(TAG, "op write " + uuid + " len=" + data.length + (noResponse ? " NR" : " REQ"));
+            BluetoothGattCharacteristic c = find(uuid);
+            if (c == null) { Log.i(TAG, "  char not found"); onWritten(uuid, -1); done(); return; }
+            c.setWriteType(noResponse ? BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
+                                      : BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT);
+            c.setValue(data);
+            if (!gatt.writeCharacteristic(c)) { Log.i(TAG, "  writeCharacteristic false"); onWritten(uuid, -1); done(); }
+        }});
+    }
+
+    private static final BluetoothGattCallback cb = new BluetoothGattCallback() {
+        @Override public void onConnectionStateChange(BluetoothGatt g, int status, int newState) {
+            if (newState == BluetoothProfile.STATE_CONNECTED) {
+                g.requestMtu(185);           /* enough for a 20-byte-chunked round, +headroom */
+            } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
+                try { g.close(); } catch (Throwable t) { /* ignore */ }
+                synchronized (Ble.class) { gatt = null; ops.clear(); busy = false; }
+                onDisconnected(status);
+            }
+        }
+        @Override public void onMtuChanged(BluetoothGatt g, int mtu, int status) {
+            g.discoverServices();
+        }
+        @Override public void onServicesDiscovered(BluetoothGatt g, int status) {
+            onConnected();
+        }
+        @Override public void onCharacteristicChanged(BluetoothGatt g,
+                BluetoothGattCharacteristic c) {
+            onNotify(c.getUuid().toString(), c.getValue());
+        }
+        @Override public void onCharacteristicWrite(BluetoothGatt g,
+                BluetoothGattCharacteristic c, int status) {
+            onWritten(c.getUuid().toString(), status);
+            done();
+        }
+        @Override public void onDescriptorWrite(BluetoothGatt g,
+                BluetoothGattDescriptor d, int status) {
+            onWritten(d.getCharacteristic().getUuid().toString(), status);
+            done();
+        }
+        @Override public void onReadRemoteRssi(BluetoothGatt g, int rssi, int status) {
+            if (status == BluetoothGatt.GATT_SUCCESS) onRssi(rssi);
+            done();
+        }
+        @Override public void onCharacteristicRead(BluetoothGatt g,
+                BluetoothGattCharacteristic c, int status) {
+            byte[] v = (status == BluetoothGatt.GATT_SUCCESS) ? c.getValue() : null;
+            Log.i(TAG, "onRead " + c.getUuid() + " status=" + status + " len=" + (v == null ? -1 : v.length));
+            onRead(c.getUuid().toString(), v == null ? new byte[0] : v);
+            done();
+        }
+    };
+}
