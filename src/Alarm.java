@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0
+// Alarm.java --- Audible + vibrating glucose alarm
+// Copyright 2026 Jakob Kastelic
+
 /* Audible + vibrating glucose alarm. Kept separate from the BLE pipe: native
  * code (main.c) decides WHEN to alarm (edge-triggered on the transition into an
  * out-of-range reading) and calls trigger()/silence() via dexble.c.
@@ -39,7 +43,8 @@ public final class Alarm {
         nm.createNotificationChannel(c);
     }
 
-    public static void trigger(Context ctx, boolean high, boolean sound, boolean vibrate) {
+    /* kind: 0 = glucose low, 1 = glucose high, 2 = stale/disconnected */
+    public static void trigger(Context ctx, int kind, boolean sound, boolean vibrate) {
         try {
             Context app = ctx.getApplicationContext();
             NotificationManager nm = app.getSystemService(NotificationManager.class);
@@ -52,8 +57,10 @@ public final class Alarm {
             PendingIntent pi = PendingIntent.getActivity(app, 0, open,
                 PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
             Notification n = new Notification.Builder(app, CH)
-                .setContentTitle(high ? "Glucose HIGH" : "Glucose LOW")
-                .setContentText("Open the app to silence")
+                .setContentTitle(kind == 2 ? "Sensor disconnected"
+                               : kind == 1 ? "Glucose HIGH" : "Glucose LOW")
+                .setContentText(kind == 2 ? "No recent readings — tap to open"
+                                          : "Open the app to silence")
                 .setSmallIcon(android.R.drawable.stat_sys_warning)
                 .setCategory(Notification.CATEGORY_ALARM)
                 .setContentIntent(pi)

@@ -1,0 +1,7 @@
+[
+  {
+    "directory": "/home/jk/projects/stealo",
+    "file": "/home/jk/projects/stealo/test/uitest.c",
+    "command": "cc -iquote src -I/usr/lib/jvm/default-java/include -I/usr/lib/jvm/default-java/include/linux -Wall -Wextra -c test/uitest.c"
+  }
+]

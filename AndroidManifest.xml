@@ -1,4 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!-- SPDX-License-Identifier: GPL-3.0 -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
           package="com.jk.stealo"
           android:versionCode="1" android:versionName="1.0">
@@ -20,11 +21,17 @@
   <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE"/>
   <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
   <uses-permission android:name="android.permission.VIBRATE"/>
+  <uses-permission android:name="android.permission.WAKE_LOCK"/>
   <!-- keep the process alive through Doze (user grants via the system dialog) -->
   <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS"/>
 
+  <!-- debuggable is intentionally absent (defaults to false = release-safe).
+       Dev builds flip it on via aapt's debug-mode flag so crash.log is
+       retrievable on-device; `make release` does not. -->
   <application android:label="Stealo"
-               android:debuggable="true"
+               android:icon="@mipmap/ic_launcher"
+               android:roundIcon="@mipmap/ic_launcher_round"
+               android:allowBackup="false"
                android:theme="@android:style/Theme.NoTitleBar">
     <activity android:name="android.app.NativeActivity" android:exported="true"
               android:configChanges="orientation|screenSize|screenLayout|keyboardHidden">

@@ -1,0 +1,8 @@
+<!-- SPDX-License-Identifier: GPL-3.0 -->
+<!-- ic_notification.xml - pixelated droplet, white silhouette for the status bar -->
+<!-- Copyright 2026 Jakob Kastelic -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+        android:width="24dp" android:height="24dp"
+        android:viewportWidth="108" android:viewportHeight="108">
+    <path android:fillColor="#FFFFFF" android:pathData="M48,12h12v12h-12zM36,24h36v12h-36zM36,36h36v12h-36zM24,48h60v12h-60zM24,60h60v12h-60zM24,72h60v12h-60zM36,84h36v12h-36z"/>
+</vector>

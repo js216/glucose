@@ -1,0 +1,31 @@
+main.c issues (2026-07-16)
+
+1. No onDestroy handler (main.c:2842): after back-press the 1 Hz timer keeps
+   firing; watchdog (2515) and notify_update (2454) deref freed g_act = UAF.
+   Activity relaunch in same process re-runs onCreate: duplicate timerfd +
+   looper callback (old one leaked, g_timerfd overwritten), leaked g_ble
+   global ref, dexble_init/store_load/stat_load re-run.
+   Fix: add onDestroy that clears g_act, removes/closes timer; guard re-init.
+
+2. stealo_backfill (2359) skips alarm_reeval() and g_notify_dirty: a LOW
+   recovered via backfill neither alarms nor updates the notification until
+   the next live reading (~5 min).
+
+3. Data race: stealo_glucose/stealo_backfill (BLE threads) mutate
+   g_hist/g_nhist/g_cur_* via hist_insert (388: g_nhist++ before slot is
+   written, then in-place shift) while main thread reads them (draw_glucose
+   859, scrub 2641). Torn reads -> garbage plot point / inconsistent
+   g_cur_glu+g_cur_time into alarm_reeval. Defer mutation to main thread
+   like drawing already is.
+
+4. stealo_devinfo (1581): strncmp(uuid+4,...) with no NULL/length check on
+   uuid -> OOB read on short/empty string.
+
+Minor:
+- notify_update (2481-2485): no NULL check after NewStringUTF/NewIntArray;
+  OOM -> SetIntArrayRegion(NULL) aborts VM.
+- First frame after on_window_created can be dropped by the 200 ms throttle
+  (2214) -> black screen up to 1 s.
+- g_glucose (206) written (1468) but never read; dead.
+- "STEALO  %s" (2198) truncates statuses >25 chars.
+- init_tz_offset (2807): NULL tz would crash (theoretical).

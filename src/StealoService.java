@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0
+// StealoService.java --- Foreground service keeping BLE alive
+// Copyright 2026 Jakob Kastelic
+
 /* Foreground service: keeps the process alive (and BLE-exempt from Doze) so the
  * sensor connection and reading collection continue when the app is not in the
  * foreground — or has been swiped away entirely, like the official app.
@@ -18,6 +22,7 @@ import android.app.Service;
 import android.content.Context;
 import android.content.Intent;
 import android.content.pm.ServiceInfo;
+import android.graphics.Bitmap;
 import android.net.Uri;
 import android.os.Build;
 import android.os.IBinder;
@@ -30,6 +35,22 @@ public final class StealoService extends Service {
     private static final String CH = "stealo";
     private static final String ACTION_WAKE = "com.jk.stealo.WAKE";
     private static final long WAKE_INTERVAL_MS = 5 * 60 * 1000L;   /* ~one sensor cycle */
+    private static PowerManager.WakeLock wakelock;
+
+    /* Hold a partial wakelock so the CPU keeps processing BLE while the screen is
+     * off. The foreground service keeps the process alive, but without this the
+     * CPU can suspend between the sensor's 5-min cycles and the reconnect stalls.
+     * This is what keeps a locked-screen CGM connection alive (small battery cost). */
+    private void holdWakelock() {
+        try {
+            if (wakelock == null) {
+                PowerManager pm = getSystemService(PowerManager.class);
+                wakelock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "stealo:ble");
+                wakelock.setReferenceCounted(false);
+            }
+            if (!wakelock.isHeld()) wakelock.acquire();
+        } catch (Throwable t) { Log.i("stealo", "wakelock: " + t); }
+    }
 
     /* called by native (via Ble.startService) at activity create */
     public static void start(Context ctx) {
@@ -55,6 +76,14 @@ public final class StealoService extends Service {
         } catch (Throwable t) { Log.i("stealo", "batteryOpt: " + t); }
     }
 
+    /* Resolve the app's pixel-droplet notification icon at runtime (this build
+     * emits no R.java), falling back to a framework icon if it isn't found. */
+    private static int notifIcon(Context ctx) {
+        int id = ctx.getResources().getIdentifier(
+            "ic_notification", "drawable", ctx.getPackageName());
+        return id != 0 ? id : android.R.drawable.ic_dialog_info;
+    }
+
     private Notification build() {
         NotificationManager nm = getSystemService(NotificationManager.class);
         nm.createNotificationChannel(
@@ -69,10 +98,43 @@ public final class StealoService extends Service {
         return new Notification.Builder(this, CH)
             .setContentTitle("Stealo")
             .setContentText("Reading glucose")
-            .setSmallIcon(android.R.drawable.ic_dialog_info)
+            .setSmallIcon(notifIcon(this))
             .setContentIntent(pi)
             .setOngoing(true)
             .build();
+    }
+
+    /* Update the ongoing (foreground-service) notification with the live glucose
+     * value + trend and a small 3H plot bitmap (px = ARGB int[w*h]), so the
+     * reading shows on the lock screen and in the shade. Called from native on
+     * each new reading. Uses the same notification id (1) so it just refreshes
+     * the FGS notification; setOnlyAlertOnce so refreshes never buzz. */
+    public static void showGlucose(Context ctx, String title, String text,
+                                   int[] px, int w, int h) {
+        try {
+            Context app = ctx.getApplicationContext();
+            NotificationManager nm = app.getSystemService(NotificationManager.class);
+            nm.createNotificationChannel(
+                new NotificationChannel(CH, "Stealo", NotificationManager.IMPORTANCE_LOW));
+            Intent open = new Intent(app, android.app.NativeActivity.class);
+            open.setAction(Intent.ACTION_MAIN);
+            open.addCategory(Intent.CATEGORY_LAUNCHER);
+            open.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_SINGLE_TOP);
+            PendingIntent pi = PendingIntent.getActivity(app, 0, open,
+                PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+            Notification.Builder b = new Notification.Builder(app, CH)
+                .setContentTitle(title)
+                .setContentText(text)
+                .setSmallIcon(notifIcon(app))
+                .setContentIntent(pi)
+                .setOngoing(true)
+                .setOnlyAlertOnce(true);
+            if (px != null && w > 0 && h > 0 && px.length >= w * h) {
+                Bitmap bmp = Bitmap.createBitmap(px, w, h, Bitmap.Config.ARGB_8888);
+                b.setStyle(new Notification.BigPictureStyle().bigPicture(bmp));
+            }
+            nm.notify(1, b.build());
+        } catch (Throwable t) { Log.i("stealo", "showGlucose: " + t); }
     }
 
     /* Re-arm a periodic wake. Stelo disconnects after every reading, so between
@@ -100,8 +162,14 @@ public final class StealoService extends Service {
             else
                 startForeground(1, build());
         } catch (Throwable t) { Log.i("stealo", "startForeground: " + t); }
+        /* i == null means the system restarted us on its own (START_STICKY) with no
+         * activity — BLE lives in the activity's native lib, so this would be a
+         * zombie (notification + wakelock, reading nothing). Don't auto-restart:
+         * stop cleanly so the app is simply gone until reopened, never a zombie. */
+        if (i == null) { stopSelf(); return START_NOT_STICKY; }
+        holdWakelock();          /* keep the CPU processing BLE while the screen is off */
         scheduleWake();          /* re-arm each time, including on each wake tick */
-        return START_STICKY;     /* restart if the system kills us */
+        return START_STICKY;     /* restart if the system kills us while running */
     }
 
     /* When the user swipes the task away, keep running: re-arm the service so the
