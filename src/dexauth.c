@@ -35,26 +35,45 @@ int dexauth_init(void)
    return 1;
 }
 
-static void get_random(uint8_t *buf, size_t n)
+/* Returns 1 only if all n bytes were filled with real entropy.
+ *
+ * This used to be void, so a failure was invisible AND left the caller's
+ * buffer untouched -- and every caller passes an uninitialised stack buffer.
+ * There is nowhere in this file where that is survivable: see rand_scalar. */
+static int get_random(uint8_t *buf, size_t n)
 {
    int fd = open("/dev/urandom", O_RDONLY);
-   if (fd >= 0) {
-      size_t off = 0;
-      while (off < n) {
-         long r = read(fd, buf + off, n - off);
-         if (r <= 0)
-            break;
-         off += (size_t)r;
-      }
-      close(fd);
+   if (fd < 0)
+      return 0;
+   size_t off = 0;
+   while (off < n) {
+      long r = read(fd, buf + off, n - off);
+      if (r <= 0)
+         break;
+      off += (size_t)r;
    }
+   close(fd);
+   return off == n;
 }
 
-static void rand_scalar(struct u256 *r)
+/* A secret scalar. Returns 0 if it could not be generated, and callers MUST
+ * treat that as fatal.
+ *
+ * Every scalar produced here is a secret whose predictability is total
+ * compromise, so there is no safe way to proceed on failure:
+ *   - the ECDSA nonce k in dexauth_getchallenge. A k that repeats or is
+ *     guessable recovers devkey_priv from the signature outright.
+ *   - xA/xB and the ZKP nonces vA/vB/v3 in dexpair_new, which are the J-PAKE
+ *     secrets the shared key is derived from.
+ * Silently signing with stack garbage is strictly worse than refusing to
+ * connect: the connection retries, a leaked private key does not un-leak. */
+static int rand_scalar(struct u256 *r)
 {
    uint8_t b[32];
-   get_random(b, 32);
+   if (!get_random(b, 32))
+      return 0;
    p256_sc_from_be(r, b);
+   return 1;
 }
 
 static void be32(uint8_t *b, uint32_t v)
@@ -138,11 +157,24 @@ static void cert_fill(struct PCert *c, const struct jpoint *p1,
    getproof(&c->hash, p1, pub, &c->pubkey2, priv, ran, party);
 }
 
-static void cert_byteify(const struct PCert *c, uint8_t out[160])
+/* Returns 0 if either point is the point at infinity, which has no affine
+ * encoding.
+ *
+ * This used to be void. Both p256_to_xy returns were dropped and `out` -- an
+ * uninitialised stack buffer in the driver -- was transmitted regardless. A
+ * PEER can force it: round 3's base is (pubA + peer_pub1 + peer_pub2), so a
+ * peer choosing pub2 = -(pubA + pub1) makes the base infinity, and then both
+ * emitted points are too. That published 128 bytes of our stack over the air,
+ * chosen by the attacker. p256_to_xy now zeroes on failure so the bytes are at
+ * least deterministic; this return is what stops them being sent at all. */
+static int cert_byteify(const struct PCert *c, uint8_t out[160])
 {
-   p256_to_xy(&c->pubkey1, out, out + 32);
-   p256_to_xy(&c->pubkey2, out + 64, out + 96);
+   /* Both calls run unconditionally -- no short-circuit -- so each half of
+    * `out` is written (zeroed on failure) whatever the other does. */
+   int ok1 = p256_to_xy(&c->pubkey1, out, out + 32);
+   int ok2 = p256_to_xy(&c->pubkey2, out + 64, out + 96);
    sc_to_be(&c->hash, out + 128);
+   return ok1 && ok2;
 }
 
 static int cert_from_bytes(struct PCert *c, const uint8_t b[160])
@@ -263,7 +295,12 @@ int dexauth_getchallenge(const uint8_t *challenge, size_t clen,
    p256_sc_from_be(&priv, pb);
    for (int t = 0; t < 32; t++) {
       struct u256 k;
-      rand_scalar(&k);
+      /* Abort, do NOT `continue`: with a dead entropy source retrying just
+       * burns the 32 attempts and every one of them would sign with the same
+       * garbage. Returning 0 fails the key challenge, which the driver already
+       * handles. */
+      if (!rand_scalar(&k))
+         return 0;
       if (p256_sc_is_zero(&k))
          continue;
       struct jpoint kg;
@@ -359,11 +396,17 @@ struct dex_pairing *dexpair_new(const uint8_t *pass, size_t passlen,
    p256_sc_from_be(&p->pass, pb);
    p->me   = is_client ? a_bytes : b_bytes;
    p->peer = is_client ? b_bytes : a_bytes;
-   rand_scalar(&p->xA);
-   rand_scalar(&p->xB);
-   rand_scalar(&p->vA);
-   rand_scalar(&p->vB);
-   rand_scalar(&p->v3);
+   /* All five or none. These are the J-PAKE secrets; proceeding with any of
+    * them unset hands the pairing a key an observer can reconstruct. The
+    * callers already handle NULL (they fail the connection), so this is the
+    * one place that has to notice. */
+   if (!rand_scalar(&p->xA) || !rand_scalar(&p->xB) || !rand_scalar(&p->vA) ||
+       !rand_scalar(&p->vB) || !rand_scalar(&p->v3)) {
+      /* dexpair_free, not free: p already holds the pairing passphrase and
+       * whichever scalars did succeed, and it wipes before releasing. */
+      dexpair_free(p);
+      return NULL;
+   }
    p256_mul_g(&p->pA, &p->xA);
    p256_mul_g(&p->pB, &p->xB);
    return p;
@@ -375,7 +418,8 @@ static int emit_round(const struct jpoint *pub, const struct u256 *priv,
 {
    struct PCert c;
    cert_fill(&c, &p256_g, pub, priv, ran, party);
-   cert_byteify(&c, out);
+   if (!cert_byteify(&c, out))
+      return 0; /* send_our_round treats 0 as fatal and fails the link */
    return 160;
 }
 
@@ -396,7 +440,10 @@ int dexpair_round3(struct dex_pairing *p, uint8_t out[160])
    struct PCert c;
    make_round3(&c, &p->r1.pubkey1, &p->r2.pubkey1, &p->pA, &p->xB, &p->pass,
                &p->v3, p->me);
-   cert_byteify(&c, out);
+   /* THE peer-reachable case: make_round3's base is pubA + r1.pubkey1 +
+    * r2.pubkey1, and the last two came off the wire. */
+   if (!cert_byteify(&c, out))
+      return 0;
    return 160;
 }
 

@@ -23,6 +23,8 @@ long read(int fd, void *b, size_t n);
 long write(int fd, const void *b, size_t n);
 int close(int fd);
 int unlink(const char *p);
+int ftruncate(int fd, long len);
+int sched_yield(void);
 long lseek(int fd, long off, int w);
 int timerfd_create(int c, int f);
 int timerfd_settime(int fd, int f, const void *n, void *o);

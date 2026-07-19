@@ -15,6 +15,8 @@ char g_model[24], g_fw[24], g_mfr[24];
 int g_alarm_low = 110, g_alarm_high = 300;
 int g_sound_on = 1, g_vib_on = 1;
 int g_orient;
+int g_screen_on = 1; /* default: hold the screen on, as the app always has */
+int g_newdata_beep;  /* short beep on each new primary-CGM datapoint (OFF/BEEP) */
 int g_units;
 int g_disc;
 int g_plot_max      = PLOT_GLU_MAX;
@@ -89,16 +91,47 @@ void alarm_load(void)
    int lo  = 0;
    int hi  = 0;
    char *q = b;
-   while (*q >= '0' && *q <= '9')
-      lo = (lo * 10) + (*q++ - '0');
+   /* DIGIT-CAPPED. Unbounded accumulation is undefined behaviour, and it
+    * happens during parsing -- before the range check below can reject
+    * anything. A wrapped value can land back inside [40,400] and silently
+    * install alarm thresholds the user never chose, on the two numbers that
+    * decide whether a hypo alarm can fire at all. store.c, stats.c and
+    * sensors.c all received this hardening; these two were missed.
+    *
+    * The advance is OUTSIDE the cap, deliberately: putting it inside is what
+    * turned the same fix in sensors.c into an infinite loop. */
+   int nd = 0;
+   while (*q >= '0' && *q <= '9') {
+      if (nd < 9) {
+         lo = (lo * 10) + (*q - '0');
+         nd++;
+      }
+      q++;
+   }
    while (*q == ' ')
       q++;
-   while (*q >= '0' && *q <= '9')
-      hi = (hi * 10) + (*q++ - '0');
-   if (lo > 0)
-      g_alarm_low = lo;
-   if (hi > 0)
+   nd = 0;
+   while (*q >= '0' && *q <= '9') {
+      if (nd < 9) {
+         hi = (hi * 10) + (*q - '0');
+         nd++;
+      }
+      q++;
+   }
+   /* Range-check, do not merely test for non-zero. A corrupt or hand-edited
+    * file with lo=99999 silently DISABLES the low alarm (nothing is ever below
+    * it) and lo>hi leaves both alarms permanently latched -- the two ways this
+    * file can fail dangerously. Bounds match the keypad's own limits, so a
+    * value that could not be typed cannot be loaded either. */
+   /* lo <= hi, not lo < hi: alarm_adjust() clamps a crossing by setting the
+    * two EQUAL (main.c), so 300/300 is a state the UI can produce and save.
+    * Rejecting it silently reverted the user's thresholds to the compiled
+    * defaults on the next launch -- values they never chose. The predicate
+    * must accept everything the writer can emit. */
+   if (lo >= 40 && lo <= 400 && hi >= 40 && hi <= 400 && lo <= hi) {
+      g_alarm_low  = lo;
       g_alarm_high = hi;
+   }
 }
 
 void settings_save(void)
@@ -107,8 +140,9 @@ void settings_save(void)
    if (fd < 0)
       return;
    char b[64];
-   int n = snprintf(b, sizeof b, "%d %d %d %d %d %d\n", g_sound_on, g_vib_on,
-                    g_orient, g_units, g_disc, g_plot_max);
+   int n = snprintf(b, sizeof b, "%d %d %d %d %d %d %d %d\n", g_sound_on,
+                    g_vib_on, g_orient, g_units, g_disc, g_plot_max,
+                    g_screen_on, g_newdata_beep);
    n     = clampn(n, sizeof b);
    if (write(fd, b, n) != n) {
    }
@@ -126,24 +160,33 @@ void settings_load(void)
    if (n <= 0)
       return;
    b[n]     = 0;
-   int v[6] = {g_sound_on, g_vib_on, g_orient, g_units, g_disc, g_plot_max};
+   int v[8] = {g_sound_on, g_vib_on,   g_orient,     g_units,
+               g_disc,     g_plot_max, g_screen_on,  g_newdata_beep};
    char *q  = b;
-   for (int i = 0; i < 6; i++) {
+   for (int i = 0; i < 8; i++) {
       while (*q == ' ')
          q++;
       if (*q < '0' || *q > '9')
          break;
-      int x = 0;
-      while (*q >= '0' && *q <= '9')
-         x = (x * 10) + (*q++ - '0');
+      int x  = 0;
+      int nd = 0; /* see alarm_load: cap the digits, advance outside the cap */
+      while (*q >= '0' && *q <= '9') {
+         if (nd < 9) {
+            x = (x * 10) + (*q - '0');
+            nd++;
+         }
+         q++;
+      }
       v[i] = x;
    }
-   g_sound_on = v[0];
-   g_vib_on   = v[1];
-   g_orient   = (int)((unsigned)v[2] & 3U);
-   g_units    = v[3] ? 1 : 0;
-   g_disc     = (v[4] >= 0 && v[4] < 4) ? v[4] : 0;
-   g_plot_max = (v[5] >= 100 && v[5] <= 400) ? v[5] : PLOT_GLU_MAX;
+   g_sound_on  = v[0];
+   g_vib_on    = v[1];
+   g_orient    = (int)((unsigned)v[2] & 3U);
+   g_units     = v[3] ? 1 : 0;
+   g_disc      = (v[4] >= 0 && v[4] < 4) ? v[4] : 0;
+   g_plot_max  = (v[5] >= 100 && v[5] <= 400) ? v[5] : PLOT_GLU_MAX;
+   g_screen_on    = v[6] ? 1 : 0;
+   g_newdata_beep = v[7] ? 1 : 0;
    plot_set_max(g_plot_max);
 }
 
@@ -174,5 +217,10 @@ void code_load(void)
    for (int i = 0; i < n && k < (int)sizeof g_code_str - 1; i++)
       if (b[i] >= '0' && b[i] <= '9')
          g_code_str[k++] = b[i];
-   g_code_str[k] = 0;
+   /* Only commit when at least one digit was parsed. A non-empty file with no
+    * digits (a partial write, or a hand-edit) would otherwise wipe a working
+    * code to "" -- every sibling loader preserves its prior value on garbage.
+    */
+   if (k > 0)
+      g_code_str[k] = 0;
 }

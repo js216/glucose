@@ -2,21 +2,49 @@
 // uitest.c --- Offline UI harness: render the pure core to PPM + check hit-test
 // Copyright 2026 Jakob Kastelic
 
-/* The UI is a pure function of a `struct screen`, so it runs with no phone: fill
- * a model, call ui_render into a plain framebuffer, dump a PPM (into tmp/uitest/,
- * never the source tree), and assert that ui_hit maps a tap to the right action.
- * As each screen is ported this harness grows a case per screen. Built and run
- * by `make uitest`. */
+/* The UI is a pure function of a `struct screen`, so it runs with no phone:
+ * fill a model, call ui_render into a plain framebuffer, dump a PPM (into
+ * tmp/uitest/, never the source tree), and assert that ui_hit maps a tap to the
+ * right action. As each screen is ported this harness grows a case per screen.
+ * Built and run by `make uitest`. */
 #include "ui.h"
+#include "plot.h" /* the capping case asserts plot_render's own mapping */
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 
 #define W 720
 #define H 360
+/* The sensor list needs a real phone's portrait height; allocate for the
+ * tallest buffer any case renders so a tall render cannot overrun. */
+#define TALL_H 1600
+/* The reachability sweep renders real device geometries up to 1440x3200, which
+ * is far larger than W x TALL_H -- g_px must cover the LARGEST buffer any case
+ * uses, not the nominal one, or the sweep writes off the end of the
+ * allocation. (It did: the first run segfaulted here.) */
+#define MAX_W 1440
+#define MAX_H 3200
 
 static uint32_t *g_px;
 static struct ANativeWindow_Buffer g_buf;
+
+static void write_ppm_buf(const struct ANativeWindow_Buffer *b,
+                          const char *path)
+{
+   FILE *f = fopen(path, "wb");
+   if (!f) {
+      perror(path);
+      exit(1);
+   }
+   fprintf(f, "P6\n%d %d\n255\n", b->width, b->height);
+   for (int i = 0; i < b->width * b->height; i++) {
+      uint32_t c         = g_px[i];
+      unsigned char p[3] = {(unsigned char)(c >> 16), (unsigned char)(c >> 8),
+                            (unsigned char)c};
+      fwrite(p, 1, 3, f);
+   }
+   fclose(f);
+}
 
 static void write_ppm(const char *path)
 {
@@ -35,6 +63,46 @@ static void write_ppm(const char *path)
    fclose(f);
 }
 
+/* Count exact-colour pixels in a buffer. The multi-sensor plot styling is only
+ * observable in the pixels -- there is no hit target for a marker -- so this is
+ * what proves ui_sensor_color() and the non-primary/orphan branches ran. */
+static long count_color(const struct ANativeWindow_Buffer *b, uint32_t want)
+{
+   long n = 0;
+   for (int i = 0; i < b->width * b->height; i++)
+      if (g_px[i] == want)
+         n++;
+   return n;
+}
+
+/* Same, but only at or below row y0. Whole-buffer counting is NOT a valid
+ * visibility test when a colour is shared: 0xFFCCCCCC is drawn both by
+ * render_info (the block under test) and by render_glucose's label column near
+ * the top, so a whole-buffer count stayed comfortably positive while every row
+ * render_info draws was off the bottom of the screen. Restricting to the lower
+ * half is what makes the assertion actually about render_info. */
+static long count_color_from(const struct ANativeWindow_Buffer *b,
+                             uint32_t want, int x0, int y0)
+{
+   long n = 0;
+   for (int y = y0; y < b->height; y++)
+      for (int x = x0; x < b->width; x++)
+         if (g_px[(y * b->stride) + x] == want)
+            n++;
+   return n;
+}
+
+/* Where render_info lives, which depends on orientation: it is the lower half
+ * in portrait but the RIGHT-HAND COLUMN in landscape (render_main splits the
+ * screen). Getting this wrong makes the assertion test the wrong pixels. */
+static long count_info_block(const struct ANativeWindow_Buffer *b,
+                             uint32_t want)
+{
+   int landscape = b->width > b->height;
+   return landscape ? count_color_from(b, want, b->width / 2, 0)
+                    : count_color_from(b, want, 0, b->height / 2);
+}
+
 static long lit_pixels(uint32_t bg)
 {
    long n = 0;
@@ -46,38 +114,42 @@ static long lit_pixels(uint32_t bg)
 
 int main(void)
 {
-   g_px  = malloc((size_t)W * H * 4);
+   g_px  = malloc((size_t)MAX_W * MAX_H * 4);
    g_buf = (struct ANativeWindow_Buffer){
        .width = W, .height = H, .stride = W, .format = 1, .bits = g_px};
 
    /* newest-first history spanning a few hours so the plot has points */
    struct ui_point hist[4] = {
-       {900, 148}, {800, 143}, {400, 155}, {100, 132}};
+       {.t = 900, .glu = 148},
+       {.t = 800, .glu = 143},
+       {.t = 400, .glu = 155},
+       {.t = 100, .glu = 132}
+   };
    struct ui_stat s = {.have = 1, .tir = 82, .avg = 149};
    struct screen m  = {
-        .scr           = SCR_MAIN,
-        .now           = 1000,
-        .glu           = 148,
-        .trend         = 2,
-        .t             = 900,
-        .rssi          = -72,
-        .rssi_ok       = 1,
-        .hist          = hist,
-        .nhist         = 4,
-        .scrub         = -1,
-        .plot_hours    = 24,
-        .plot_max      = 300,
-        .bonded        = 1,
-        .have_reading  = 1,
-        .predicted     = 152,
-        .sequence      = 41,
+        .scr             = SCR_MAIN,
+        .now             = 1000,
+        .glu             = 148,
+        .trend           = 2,
+        .t               = 900,
+        .rssi            = -72,
+        .rssi_ok         = 1,
+        .hist            = hist,
+        .nhist           = 4,
+        .scrub           = -1,
+        .plot_hours      = 24,
+        .plot_max        = 300,
+        .bonded          = 1,
+        .have_reading    = 1,
+        .predicted       = 152,
+        .sequence        = 41,
         .session_seconds = 3L * 86400,
-        .stored        = 812,
-        .units         = 0,
-        .alarm_low     = 100,
-        .alarm_high    = 300,
-        .status        = "CONNECTED",
-        .stat          = {s, s, s, s, s},
+        .stored          = 812,
+        .units           = 0,
+        .alarm_low       = 100,
+        .alarm_high      = 300,
+        .status          = "CONNECTED",
+        .stat            = {s, s, s, s, s},
    };
 
    int fail = 0;
@@ -108,8 +180,8 @@ int main(void)
       saw_high |= (k == ACT_ALARM_HIGH);
    }
    if (!(saw_tab && saw_scrub && saw_low && saw_high)) {
-      printf("  FAIL: missing targets tab=%d scrub=%d low=%d high=%d\n", saw_tab,
-             saw_scrub, saw_low, saw_high);
+      printf("  FAIL: missing targets tab=%d scrub=%d low=%d high=%d\n",
+             saw_tab, saw_scrub, saw_low, saw_high);
       fail = 1;
    }
    /* a tap in dead space (far right edge, top) must do nothing */
@@ -119,19 +191,34 @@ int main(void)
    }
 
    /* --- no-reading screen (scan status + sensor list) --- */
-   struct ui_dev devs[2] = {{"DX01AB", "F8:DA:11:22:33:44", -61},
-                            {"DX01CD", "C1:22:33:44:55:66", -80}};
-   struct screen scan    = {.scr       = SCR_MAIN,
-                            .glu       = -1,
-                            .status    = "SCANNING",
-                            .adv_total = 137,
-                            .devs      = devs,
-                            .ndev      = 2};
+   struct ui_dev devs[2] = {
+       {"DX01AB", "F8:DA:11:22:33:44", -61},
+       {"DX01CD", "C1:22:33:44:55:66", -80}
+   };
+   struct screen scan = {.scr       = SCR_MAIN,
+                         .glu       = -1,
+                         .status    = "SCANNING",
+                         .adv_total = 137,
+                         .devs      = devs,
+                         .ndev      = 2};
    ui_render(&g_buf, &scan, &h);
    write_ppm("tmp/uitest/scan.ppm");
    if (lit_pixels(0xFF181818) < 200) {
       printf("  FAIL: no-reading screen rendered almost nothing\n");
       fail = 1;
+   }
+   /* It must be possible to REACH SETTINGS with no reading yet. This screen
+    * recorded no hit targets at all, and on_input has no fallback -- so on a
+    * fresh install the pairing flow was unreachable by touch, which is the one
+    * thing a fresh install has to do. */
+   {
+      int saw_set = 0;
+      for (int i = 0; i < h.n; i++)
+         saw_set |= (h.box[i].kind == ACT_OPEN_SETTINGS);
+      if (!saw_set) {
+         printf("  FAIL: no-reading screen has no way to open settings\n");
+         fail = 1;
+      }
    }
 
    /* --- settings screen (rows carry menu_action codes via ACT_MENU) --- */
@@ -139,13 +226,14 @@ int main(void)
    set.scr           = SCR_SETTINGS;
    set.plot_max      = 300;
    set.sound_on      = 1;
+   set.screen_on     = 1;
    set.perm[0] = set.perm[1] = set.perm[2] = 1;
-   set.batt_ok       = 1;
-   set.standby_bucket = 10;
-   set.code          = "1234";
-   set.mac           = "F8:DA:11:22:33:44";
-   set.model         = "SW11163";
-   set.fw            = "1.6.5.15";
+   set.batt_ok                             = 1;
+   set.standby_bucket                      = 10;
+   set.code                                = "1234";
+   set.mac                                 = "F8:DA:11:22:33:44";
+   set.model                               = "SW11163";
+   set.fw                                  = "1.6.5.15";
    ui_render(&g_buf, &set, &h);
    write_ppm("tmp/uitest/settings.ppm");
    if (lit_pixels(0xFF181818) < 500) {
@@ -181,8 +269,7 @@ int main(void)
    }
 
    /* --- device list (a pick per scanned sensor) --- */
-   struct screen dl = {
-       .scr = SCR_DEVLIST, .devs = devs, .ndev = 2};
+   struct screen dl = {.scr = SCR_DEVLIST, .devs = devs, .ndev = 2};
    ui_render(&g_buf, &dl, &h);
    write_ppm("tmp/uitest/devlist.ppm");
    int picks = 0;
@@ -191,6 +278,1099 @@ int main(void)
    if (picks != 2) {
       printf("  FAIL: device list recorded %d picks, want 2\n", picks);
       fail = 1;
+   }
+
+   /* --- sensor list in settings (space check + rows) --- */
+   struct ui_sensor sens[3] = {
+       {.id              = 1,
+        .type            = SENSOR_STELO,
+        .kind            = KIND_CGM,
+        .primary         = 1,
+        .color           = 0,
+        .marker          = 0,
+        .last            = 900,
+        .session_seconds = 3L * 86400,
+        .connected       = 1,
+        .label           = "STELO",
+        .status          = "CONNECTED",
+        .mac             = "F8:DA:11:22:33:44",
+        .model           = "SW11163",
+        .fw              = "1.6.5.15"},
+       {.id     = 2,
+        .type   = SENSOR_G7,
+        .kind   = KIND_CGM,
+        .color  = 1,
+        .marker = 1,
+        .last   = 400,
+        .label  = "G7",
+        .status = "IDLE",
+        .mac    = "C1:22:33:44:55:66"},
+       {.id     = 3,
+        .type   = SENSOR_ONETOUCH,
+        .kind   = KIND_BGM,
+        .color  = 2,
+        .marker = 2,
+        .last   = 100,
+        .label  = "KITCHEN",
+        .status = "OFF",
+        .mac    = "F7:F0:20:2D:77:28"},
+   };
+   /* A realistic epoch: session start/end rows derive from now, so the toy
+    * clock used by the plot cases would render them as pre-1970 nonsense. */
+   const long NOW = 1784358853L; /* 2026-07-18 */
+   set.now        = NOW;
+   sens[0].last   = NOW - 100;
+   sens[1].last   = NOW - 4000;
+   sens[2].last   = NOW - 200000;
+   set.sensors    = sens;
+   set.nsensors   = 3;
+   set.sel        = -1;
+   /* A phone-shaped portrait buffer: the 720x360 test surface is far too short
+    * for the sensor list, and asserting on it would test nothing real. */
+   struct ANativeWindow_Buffer tall = {
+       .width = W, .height = TALL_H, .stride = W, .format = 1, .bits = g_px};
+   int cap = ui_sensor_capacity(W, TALL_H);
+   printf("uitest: sensor capacity at %dx%d = %d (min %d, max %d)\n", W, TALL_H,
+          cap, UI_MIN_SLOTS, UI_MAX_SLOTS);
+   if (cap < UI_MIN_SLOTS) {
+      printf("  FAIL: portrait phone must fit at least %d sensors\n",
+             UI_MIN_SLOTS);
+      fail = 1;
+   }
+   ui_render(&tall, &set, &h);
+   write_ppm_buf(&tall, "tmp/uitest/settings_tall.ppm");
+   {
+      int saw[3] = {0, 0, 0};
+      for (int i = 0; i < h.n; i++)
+         for (int k = 0; k < 3; k++)
+            if (h.box[i].kind == ACT_MENU && h.box[i].arg == MA_SENSOR + k)
+               saw[k] = 1;
+      if (!(saw[0] && saw[1] && saw[2])) {
+         printf("  FAIL: sensor rows not all tappable (%d %d %d)\n", saw[0],
+                saw[1], saw[2]);
+         fail = 1;
+      }
+      int saw_add = 0;
+      for (int i = 0; i < h.n; i++)
+         saw_add |= (h.box[i].kind == ACT_MENU && h.box[i].arg == MA_ADDSENSOR);
+      if (!saw_add) {
+         printf("  FAIL: no ADD NEW SENSOR target\n");
+         fail = 1;
+      }
+   }
+
+   /* --- layout must fit, and essential controls must be REACHABLE ---
+    *
+    * Two failure modes, both shipped before: (a) the scale was derived from
+    * WIDTH while the pitch it produced was spent on HEIGHT, so capacity fell
+    * below the minimum on 16:9/18:9 phones and render_settings drew no sensor
+    * rows and no ADD row at all; (b) ui_settings_scale and ui_sensor_capacity
+    * disagreed by 8*sc, so the lockout still fired on 1080x2280 (Galaxy S10)
+    * and 1440x3200. Scrolling is ruled out by design, so off-screen content is
+    * simply unreachable. Sweep geometries AND assert the controls exist. */
+   {
+      static const int shapes[][2] = {
+          {1080, 1920},
+          {1440, 2560},
+          {1080, 2160},
+          {1080, 2280},
+          {1440, 3120},
+          {1440, 3200},
+          {1080, 2340},
+          {828,  1792},
+          {1080, 2400},
+          {720,  1600},
+          {720,  1280},
+          {480,  800 },
+          /* LANDSCAPE. The sweep had none, which is why three screens kept
+           * width-only scaling: in landscape that puts their controls below
+           * the buffer, and SCR_FORGET records no close target, so it became
+           * a dead end with no way out. */
+          {1920, 1080},
+          {2340, 1080},
+          {2400, 1080},
+          {2560, 1440},
+          {3120, 1440},
+          {1600, 720 },
+          /* Split-screen / freeform windows. The manifest allows resizing, so
+           * these heights are reachable, and they are where the info block was
+           * still being laid out entirely off-screen. */
+          {1080, 1100},
+          {1080, 1400},
+          {1080, 1500},
+          {1440, 1300},
+          /* SMALL windows. The list jumped from {480,800} straight to 1080-wide
+           * split-screen shapes, skipping the whole 715..1078 band at narrow
+           * widths -- which is exactly where the out-of-range banner was being
+           * laid out past the bottom of the buffer. */
+          {480,  720 },
+          {480,  760 },
+          {540,  730 },
+          {600,  740 },
+          {640,  900 },
+          {720,  748 },
+          {720,  1000},
+          {768,  1000},
+          {828,  1075},
+          {900,  1078},
+      };
+      int nshape = (int)(sizeof shapes / sizeof shapes[0]);
+      int nscr   = 0; /* set inside the loop from the array itself */
+      for (int i = 0; i < nshape; i++) {
+         int sw = shapes[i][0], sh = shapes[i][1];
+         int ssc  = ui_settings_scale(sw, sh);
+         int scap = ui_sensor_capacity(sw, sh);
+         int slh  = 16 * ssc;
+         int need = (sh / 20) + (8 * ssc) + (23 + scap + 1) * slh;
+         if (scap < UI_MIN_SLOTS || need > sh) {
+            printf("  FAIL: %dx%d capacity %d (min %d), needs %d of %d px\n",
+                   sw, sh, scap, UI_MIN_SLOTS, need, sh);
+            fail = 1;
+         }
+      }
+      /* Dense sweep: the two functions must agree at EVERY plausible size, not
+       * just at the dozen shapes above -- that is how the 8*sc gap survived. */
+      int swept = 0, swbad = 0;
+      static const int widths[] = {480, 540, 600,  640,  720,  768,
+                                   828, 900, 1080, 1200, 1242, 1440};
+      for (unsigned wi = 0; wi < sizeof widths / sizeof widths[0]; wi++) {
+         int sw = widths[wi];
+         for (int sh = (sw * 12) / 10; sh <= sw * 3; sh++) {
+            int ssc  = ui_settings_scale(sw, sh);
+            int scap = ui_sensor_capacity(sw, sh);
+            int need =
+                (sh / 20) + (8 * ssc) + (UI_SET_ABOVE + scap + 1) * 16 * ssc;
+            swept++;
+            if (scap < UI_MIN_SLOTS || need > sh) {
+               if (!swbad)
+                  printf("  FAIL: sweep %dx%d cap=%d need=%d\n", sw, sh, scap,
+                         need);
+               swbad++;
+            }
+         }
+      }
+      if (swbad)
+         fail = 1;
+      printf("uitest: layout swept %d geometries, %d bad\n", swept, swbad);
+
+      /* Reachability + VISIBILITY.
+       *
+       * A hit-box bounds check alone is not enough and gave false confidence:
+       * draw_cell clips, so text drawn past the bottom simply never appears --
+       * it has no hit box to be out of bounds. The whole stats table and the
+       * LOW/HIGH/STALE banner were invisible on every realistic phone window
+       * while this sweep reported OK. Colour presence is the honest detector:
+       * if the content did not land on screen, its pixels do not exist. */
+      struct ui_sensor rs = sens[0];
+      rs.session_seconds  = 16L * 86400; /* expired -> PAIR NEW SENSOR prompt */
+      /* Populate EVERY optional row, or render_sensor's worst case -- the one
+       * ui_fit_scale(.., 25) is sized for -- is never actually exercised. */
+      (void)snprintf(rs.serial, sizeof rs.serial, "SN123456");
+      (void)snprintf(rs.code, sizeof rs.code, "1234");
+      rs.predicted = 152;
+      rs.sequence  = 41;
+      for (int i = 0; i < nshape; i++) {
+         int sw = shapes[i][0], sh = shapes[i][1];
+         struct ANativeWindow_Buffer rb = {.width  = sw,
+                                           .height = sh,
+                                           .stride = sw,
+                                           .format = 1,
+                                           .bits   = g_px};
+         /* Sweep EVERY screen, not just three -- the excluded ones were
+          * exactly where the un-converted width-only scaling survived. */
+         static const int scrs[] = {
+             SCR_MAIN,  SCR_SETTINGS, SCR_SENSOR,  SCR_CAL,  SCR_FORGET,
+             SCR_LABEL, SCR_KEYPAD,   SCR_DEVLIST, SCR_GATE, SCR_SENSTYPE};
+         nscr = (int)(sizeof scrs / sizeof scrs[0]);
+         for (int c = 0; c < (int)(sizeof scrs / sizeof scrs[0]); c++) {
+            struct screen rr = set;
+            rr.scr           = scrs[c];
+            /* SCR_CAL was only ever swept with cal_have == 0, which renders a
+             * short early-return stub -- the full panel (bounds, last result,
+             * ENTER VALUE) was never laid out at any swept geometry. */
+            rr.cal_have      = 1;
+            rr.cal_permitted = 1;
+            rr.cal_status    = 2;
+            rr.cal_last_bg   = 142;
+            rr.cal_result    = 0;
+            rr.now           = NOW;
+            rr.t             = NOW - 100;
+            /* A FULL sensor list, not one row.
+             *
+             * This swept nsensors = 1, so the settings screen -- the only
+             * screen whose height grows with content -- was never laid out at
+             * its worst case at any of these geometries. A mutation adding
+             * three rows to render_settings without bumping UI_SET_ABOVE
+             * passed the entire gate, while a full list clipped 8368 glyph
+             * cells and put hit boxes 52 px below a 1080x1920 screen. With no
+             * scrolling those rows and their tap targets are permanently
+             * unreachable. The list is capped to what the geometry claims it
+             * can show, so this asserts the screen honours its OWN promise. */
+            int cap_here = ui_sensor_capacity(sw, sh);
+            int nshow    = cap_here < 3 ? cap_here : 3;
+            rr.sensors   = sens;
+            rr.nsensors  = nshow;
+            rr.sel       = 0;
+            rr.devs      = devs;
+            rr.ndev      = 2;
+            rr.entry     = "1234";
+            ui_clip_reset();
+            ui_render(&rb, &rr, &h);
+            /* Nothing may be laid out past an edge. This is the check that
+             * actually catches invisible content -- hit-box bounds and colour
+             * presence both miss it (a shared colour drawn elsewhere keeps the
+             * count positive, and content without a hit box has no box to be
+             * out of range). */
+            if (ui_clipped() > 0) {
+               printf("  FAIL: scr %d at %dx%d: %ld glyph cells clipped\n",
+                      scrs[c], sw, sh, ui_clipped());
+               fail = 1;
+            }
+            for (int k = 0; k < h.n; k++) {
+               /* BOTH axes: the stats rows were clipped horizontally too. */
+               /* A DEGENERATE box (w or h <= 0) can never satisfy ui_hit's
+                * `y < by + h`, so the control draws normally and simply does
+                * not respond. It also defeats the bounds test below, because a
+                * negative h makes y+h SMALLER. That is how a keypad with 0 of
+                * 12 tappable keys passed this sweep. Check it first. */
+               /* A SUB-FINGERTIP box is the same defect one step milder:
+                * w<=0/h<=0 catches only a fully dead target, so shrinking a
+                * control to 1 px left it drawing normally and untappable, and
+                * the gate stayed green. This check lived on SCR_KEYPAD alone;
+                * everywhere else a 1-px control passed -- including the
+                * first-run gate's CONTINUE, which would make the app unusable
+                * from install, and the delete confirmation's CANCEL, whose
+                * death leaves the destructive control under the finger. */
+               if (h.box[k].w <= 0 || h.box[k].h <= 0 || h.box[k].w < 8 ||
+                   h.box[k].h < 8) {
+                  printf("  FAIL: scr %d at %dx%d: target kind=%d arg=%d is "
+                         "unhittable (w=%d h=%d) -- draws but cannot be "
+                         "tapped\n",
+                         scrs[c], sw, sh, h.box[k].kind, h.box[k].arg,
+                         h.box[k].w, h.box[k].h);
+                  fail = 1;
+               } else if (h.box[k].y < 0 || h.box[k].y + h.box[k].h > sh ||
+                          h.box[k].x < 0 || h.box[k].x + h.box[k].w > sw) {
+                  printf("  FAIL: scr %d at %dx%d: target kind=%d arg=%d "
+                         "x=%d..%d y=%d..%d outside buffer\n",
+                         scrs[c], sw, sh, h.box[k].kind, h.box[k].arg,
+                         h.box[k].x, h.box[k].x + h.box[k].w, h.box[k].y,
+                         h.box[k].y + h.box[k].h);
+                  fail = 1;
+               }
+            }
+         }
+         /* Essential controls must EXIST (not merely be in bounds). */
+         struct screen rm   = m;
+         rm.now             = NOW;
+         rm.t               = NOW - 100;
+         rm.session_seconds = 16L * 86400;
+         rm.sensors         = &rs;
+         rm.nsensors        = 1;
+         ui_clip_reset();
+         ui_render(&rb, &rm, &h);
+         if (ui_clipped() > 0) {
+            printf("  FAIL: %dx%d expired-main: %ld glyph cells clipped\n", sw,
+                   sh, ui_clipped());
+            fail = 1;
+         }
+         int saw_pair = 0;
+         for (int k = 0; k < h.n; k++)
+            saw_pair |= (h.box[k].kind == ACT_PAIR_NEW);
+         if (!saw_pair) {
+            printf("  FAIL: %dx%d: expired sensor has no PAIR NEW target\n", sw,
+                   sh);
+            fail = 1;
+         }
+         /* The NO-READING main screen, across geometries. It is what a fresh
+          * install shows -- the state in which the app has to be usable enough
+          * to pair a sensor -- and it was only ever rendered at one size. */
+         struct screen nr = {.scr       = SCR_MAIN,
+                             .glu       = -1,
+                             .now       = NOW,
+                             .status    = "SCANNING",
+                             .adv_total = 137,
+                             .devs      = devs,
+                             .ndev      = 2};
+         ui_clip_reset();
+         ui_render(&rb, &nr, &h);
+         if (ui_clipped() > 0) {
+            printf("  FAIL: %dx%d no-reading: %ld glyph cells clipped\n", sw,
+                   sh, ui_clipped());
+            fail = 1;
+         }
+         {
+            int ok_set = 0;
+            for (int k = 0; k < h.n; k++) {
+               if (h.box[k].w <= 0 || h.box[k].h <= 0) {
+                  printf("  FAIL: %dx%d no-reading: degenerate target\n", sw,
+                         sh);
+                  fail = 1;
+               }
+               ok_set |= (h.box[k].kind == ACT_OPEN_SETTINGS);
+            }
+            if (!ok_set) {
+               printf("  FAIL: %dx%d no-reading: cannot reach settings\n", sw,
+                      sh);
+               fail = 1;
+            }
+         }
+
+         /* UNBONDED main screen: render_info's STATE row then carries the
+          * status string and the advert count, which is far wider than the AVG
+          * row the budget was sized for. The harness set .bonded = 1 and never
+          * cleared it, so this row was never laid out anywhere. */
+         struct screen ub = m;
+         ub.now           = NOW;
+         ub.t             = NOW - 100;
+         ub.bonded        = 0;
+         ub.status        = "METER: REGISTER FAILED";
+         ub.adv_total     = 1482137;
+         ui_clip_reset();
+         ui_render(&rb, &ub, &h);
+         if (ui_clipped() > 0) {
+            printf("  FAIL: %dx%d unbonded main: %ld glyph cells clipped\n", sw,
+                   sh, ui_clipped());
+            fail = 1;
+         }
+
+         /* Repeat the whole main-screen check in mmol/L. The sweep only ever
+          * used mg/dL, so the wider units label ("MMOL/L", 6 chars vs 5) was
+          * never exercised -- and it is exactly what overflowed the row. */
+         struct screen mm = m;
+         mm.now           = NOW;
+         mm.t             = NOW - 100;
+         mm.units         = 1;
+         ui_clip_reset();
+         ui_render(&rb, &mm, &h);
+         if (ui_clipped() > 0) {
+            printf("  FAIL: %dx%d mmol main: %ld glyph cells clipped\n", sw, sh,
+                   ui_clipped());
+            fail = 1;
+         }
+         /* The LOW banner and the stats table must actually be VISIBLE. */
+         struct screen lo = m;
+         lo.now           = NOW;
+         lo.t             = NOW - 100;
+         lo.glu = 45; /* below 50: the big number turns red, so a shared
+                       * colour would make the banner check meaningless */
+         lo.alarm_low       = 100;
+         lo.session_seconds = 3L * 86400;
+         ui_clip_reset();
+         ui_render(&rb, &lo, &h);
+         if (ui_clipped() > 0) {
+            printf("  FAIL: %dx%d low-main: %ld glyph cells clipped\n", sw, sh,
+                   ui_clipped());
+            fail = 1;
+         }
+         /* 0xFF2020E0 is the LOW banner's own colour -- see ui.c. Using
+          * glu_color's red here was vacuous: the big number uses it too. */
+         /* HIGH and STALE get the same treatment as LOW: each banner has a
+          * colour no other element draws, so "visible" means the banner. */
+         struct screen hi = lo;
+         hi.glu           = 350;
+         hi.alarm_high    = 300;
+         hi.alarm_low     = 100;
+         ui_render(&rb, &hi, &h);
+         if (count_color(&rb, 0xFF20A0FF) <= 0) {
+            printf("  FAIL: %dx%d: HIGH banner not visible on screen\n", sw,
+                   sh);
+            fail = 1;
+         }
+         struct screen st2 = lo;
+         st2.disc_alarmed  = 1;
+         ui_render(&rb, &st2, &h);
+         if (count_color(&rb, 0xFF00D0FF) <= 0) {
+            printf("  FAIL: %dx%d: STALE banner not visible on screen\n", sw,
+                   sh);
+            fail = 1;
+         }
+         ui_render(&rb, &lo, &h);
+         if (count_color(&rb, 0xFF2020E0) <= 0) {
+            printf("  FAIL: %dx%d: LOW banner not visible on screen\n", sw, sh);
+            fail = 1;
+         }
+         if (count_info_block(&rb, 0xFFCCCCCC) <= 0) {
+            printf("  FAIL: %dx%d: stats/info block not visible on screen\n",
+                   sw, sh);
+            fail = 1;
+         }
+         /* The gate's medical disclaimer must be visible in full. */
+         struct screen gt = set;
+         gt.scr           = SCR_GATE;
+         ui_render(&rb, &gt, &h);
+         /* 0xFF777777 is the DISCLAIMER's own colour. The previous check used
+          * 0xFFCCCCCC -- the intro body copy, drawn at the top -- so it never
+          * looked at the disclaimer at all, which really was being clipped. */
+         if (count_color(&rb, 0xFF777777) <= 0) {
+            printf("  FAIL: %dx%d: gate disclaimer not visible\n", sw, sh);
+            fail = 1;
+         }
+      }
+      /* Count derived, never hardcoded: a stale literal is exactly how a screen
+       * gets dropped from the sweep without anyone noticing. */
+      printf("uitest: reachability+visibility on %d shapes x %d screens\n",
+             nshape, nscr);
+   }
+
+   /* --- no screen may be a dead end ---
+    *
+    * A modal that records zero hit targets is unrecoverable: ui_render clears
+    * them and on_input swallows every tap while a menu is open. Three screens
+    * returned early on a stale `sel` and did exactly that -- blank screen,
+    * force-stop required. Every modal must offer a way out regardless of state.
+    */
+   {
+      static const int modal[] = {SCR_SENSOR,   SCR_CAL,      SCR_FORGET,
+                                  SCR_LABEL,    SCR_KEYPAD,   SCR_DEVLIST,
+                                  SCR_SENSTYPE, SCR_SETTINGS, SCR_GATE};
+      for (int i = 0; i < (int)(sizeof modal / sizeof modal[0]); i++) {
+         struct screen bad = set;
+         bad.scr           = modal[i];
+         bad.sel           = -1; /* stale selection */
+         bad.nsensors      = 0;
+         bad.sensors       = 0;
+         bad.ndev          = 0;
+         ui_render(&tall, &bad, &h);
+         int usable = 0;
+         for (int k = 0; k < h.n; k++)
+            if (h.box[k].w > 0 && h.box[k].h > 0)
+               usable = 1;
+         if (!usable) {
+            printf("  FAIL: screen %d with sel=-1 has no usable hit target "
+                   "(dead end)\n",
+                   modal[i]);
+            fail = 1;
+         }
+      }
+      /* ui_hit must return the target's ARG, not just its kind.
+       *
+       * The whole menu_action protocol rides on arg: every settings row, keypad
+       * digit, sensor row, device pick and FORGET YES/NO is distinguished only
+       * by it. Returning a constant collapses all of them onto MA_ORIENT --
+       * "every tap rotates the screen" -- and the suite passed, because ui_hit
+       * was called three times in this file and every other assertion read
+       * h.box[] directly, bypassing the dispatch entirely. */
+      {
+         struct hits hh;
+         struct screen sm               = set;
+         sm.scr                         = SCR_SETTINGS;
+         int bad                        = 0;
+         int checked                    = 0;
+         struct ANativeWindow_Buffer hb = {.width  = W,
+                                           .height = TALL_H,
+                                           .stride = W,
+                                           .format = 1,
+                                           .bits   = g_px};
+         ui_render(&hb, &sm, &hh);
+         for (int i = 0; i < hh.n; i++) {
+            if (hh.box[i].kind != ACT_MENU || hh.box[i].w <= 0 ||
+                hh.box[i].h <= 0)
+               continue;
+            int cx            = hh.box[i].x + hh.box[i].w / 2;
+            int cy            = hh.box[i].y + hh.box[i].h / 2;
+            struct action got = ui_hit(&hh, cx, cy);
+            checked++;
+            /* The last box covering the point wins, so compare against that. */
+            int want_arg = -1, want_kind = -1;
+            for (int k = hh.n - 1; k >= 0; k--)
+               if (cx >= hh.box[k].x && cx < hh.box[k].x + hh.box[k].w &&
+                   cy >= hh.box[k].y && cy < hh.box[k].y + hh.box[k].h) {
+                  want_kind = hh.box[k].kind;
+                  want_arg  = hh.box[k].arg;
+                  break;
+               }
+            if (got.kind != want_kind || got.arg != want_arg) {
+               printf("  FAIL: ui_hit at (%d,%d) gave kind=%d arg=%d, "
+                      "want kind=%d arg=%d\n",
+                      cx, cy, got.kind, got.arg, want_kind, want_arg);
+               bad = 1;
+            }
+         }
+         if (checked < 5) {
+            printf("  FAIL: only %d ACT_MENU targets probed; the sweep is not "
+                   "exercising the dispatch\n",
+                   checked);
+            bad = 1;
+         }
+         if (bad)
+            fail = 1;
+         printf("uitest: ui_hit dispatch verified on %d settings targets\n",
+                checked);
+      }
+
+      /* A DESTRUCTIVE code must not appear on ANY screen but its own.
+       *
+       * The per-screen count below closes the SCR_FORGET case, but the class is
+       * wider: a read-only row on some other screen carrying MA_FORGET_YES
+       * fires driver_forget() on the sensor's link the moment it is tapped. Two
+       * such mutants (the sensor-detail MAC row, the settings STANDBY row)
+       * survived a screen-local check. Scan every screen instead. */
+      {
+         static const int allscr[] = {SCR_MAIN,     SCR_SETTINGS, SCR_SENSOR,
+                                      SCR_CAL,      SCR_KEYPAD,   SCR_DEVLIST,
+                                      SCR_SENSTYPE, SCR_LABEL,    SCR_GATE};
+         struct ANativeWindow_Buffer db = {.width  = W,
+                                           .height = TALL_H,
+                                           .stride = W,
+                                           .format = 1,
+                                           .bits   = g_px};
+         for (unsigned si = 0; si < sizeof allscr / sizeof allscr[0]; si++) {
+            struct hits dh;
+            struct screen dm = set;
+            dm.scr           = allscr[si];
+            dm.sel           = 0;
+            ui_render(&db, &dm, &dh);
+            for (int i = 0; i < dh.n; i++)
+               if (dh.box[i].kind == ACT_MENU &&
+                   dh.box[i].arg == MA_FORGET_YES) {
+                  printf("  FAIL: screen %d carries MA_FORGET_YES -- only "
+                         "SCR_FORGET may, and tapping it destroys the bond\n",
+                         allscr[si]);
+                  fail = 1;
+                  break;
+               }
+         }
+         printf("uitest: destructive code confined to its own screen\n");
+      }
+
+      /* A DESTRUCTIVE code must appear exactly once, on the control that means
+       * it. Asserting only that MA_FORGET_NO is PRESENT is satisfied by the
+       * pre-guard escape hatch at the top of render_forget, so miswiring the
+       * CANCEL row to MA_FORGET_YES passed the whole suite -- tapping CANCEL on
+       * the delete confirmation would forget the sensor: driver_forget() on its
+       * link, the bond destroyed, its DIS cache cleared. */
+      {
+         struct hits fh;
+         struct screen fm                = set;
+         fm.scr                          = SCR_FORGET;
+         fm.sel                          = 0;
+         struct ANativeWindow_Buffer fb2 = {.width  = W,
+                                            .height = TALL_H,
+                                            .stride = W,
+                                            .format = 1,
+                                            .bits   = g_px};
+         ui_render(&fb2, &fm, &fh);
+         int nyes = 0, nno = 0, ymin_yes = 1 << 30, ymax_no = -1;
+         for (int i = 0; i < fh.n; i++) {
+            if (fh.box[i].kind != ACT_MENU)
+               continue;
+            if (fh.box[i].arg == MA_FORGET_YES) {
+               nyes++;
+               if (fh.box[i].y < ymin_yes)
+                  ymin_yes = fh.box[i].y;
+            }
+            if (fh.box[i].arg == MA_FORGET_NO) {
+               nno++;
+               if (fh.box[i].y > ymax_no)
+                  ymax_no = fh.box[i].y;
+            }
+         }
+         if (nyes != 1) {
+            printf("  FAIL: SCR_FORGET records %d MA_FORGET_YES targets, want "
+                   "exactly 1 -- a second one means a non-destructive control "
+                   "carries the destructive code\n",
+                   nyes);
+            fail = 1;
+         }
+         if (nno < 1) {
+            printf("  FAIL: SCR_FORGET records no MA_FORGET_NO target\n");
+            fail = 1;
+         }
+         /* CANCEL is drawn above FORGET, so the lowest NO must sit above YES.
+          */
+         if (nyes == 1 && ymax_no > ymin_yes) {
+            printf(
+                "  FAIL: SCR_FORGET has a CANCEL target BELOW the destructive "
+                "one (no=%d yes=%d)\n",
+                ymax_no, ymin_yes);
+            fail = 1;
+         }
+         printf("uitest: destructive code appears once, below cancel\n");
+
+         /* THE DEVICE PICK MUST INDEX THE MODEL, NOT THE SORTED ROW.
+          *
+          * render_devlist sorts by RSSI while main.c does
+          * commit_pair(g_devs[arg - MA_DEV_PICK].mac) against the UNSORTED
+          * array. The existing fixture is {-61,-80} -- already descending, so
+          * the sorted position and the model index coincide and a mutant using
+          * either passed. With a permuting order the user taps the nearest
+          * sensor and the app pairs a different one, running driver_forget() on
+          * a live link first. */
+         {
+            struct ui_dev dv[3];
+            for (int i = 0; i < 3; i++)
+               dv[i] = devs[0];
+            (void)snprintf(dv[0].mac, sizeof dv[0].mac, "AA:00:00:00:00:00");
+            (void)snprintf(dv[1].mac, sizeof dv[1].mac, "BB:11:11:11:11:11");
+            (void)snprintf(dv[2].mac, sizeof dv[2].mac, "CC:22:22:22:22:22");
+            dv[0].rssi =
+                -90; /* weakest first, so sorted order != array order */
+            dv[1].rssi = -55; /* strongest */
+            dv[2].rssi = -70;
+            struct hits vh;
+            struct screen vm               = set;
+            vm.scr                         = SCR_DEVLIST;
+            vm.devs                        = dv;
+            vm.ndev                        = 3;
+            struct ANativeWindow_Buffer vb = {.width  = W,
+                                              .height = TALL_H,
+                                              .stride = W,
+                                              .format = 1,
+                                              .bits   = g_px};
+            ui_render(&vb, &vm, &vh);
+            /* Every device must be pickable exactly once, by its MODEL index.
+             */
+            int seen[3] = {0, 0, 0};
+            for (int i = 0; i < vh.n; i++)
+               if (vh.box[i].kind == ACT_MENU && vh.box[i].arg >= MA_DEV_PICK &&
+                   vh.box[i].arg < MA_DEV_PICK + 3)
+                  seen[vh.box[i].arg - MA_DEV_PICK]++;
+            for (int k = 0; k < 3; k++)
+               if (seen[k] != 1) {
+                  printf("  FAIL: device %d pickable %d times -- the pick "
+                         "index does "
+                         "not map 1:1 to the model array\n",
+                         k, seen[k]);
+                  fail = 1;
+               }
+            /* Uniqueness is not enough: indexing by sorted POSITION also
+             * yields each code exactly once, just attached to the wrong
+             * device. Rows are drawn strongest-RSSI first, so walking them top
+             * to bottom must give the MODEL indices in RSSI order -- here
+             * 1 (-55), 2 (-70), 0 (-90). */
+            int rows[3], nr = 0;
+            for (int i = 0; i < vh.n && nr < 3; i++)
+               if (vh.box[i].kind == ACT_MENU && vh.box[i].arg >= MA_DEV_PICK &&
+                   vh.box[i].arg < MA_DEV_PICK + 3)
+                  rows[nr++] = i;
+            for (int a = 0; a < nr; a++)
+               for (int b = a + 1; b < nr; b++)
+                  if (vh.box[rows[b]].y < vh.box[rows[a]].y) {
+                     int t   = rows[a];
+                     rows[a] = rows[b];
+                     rows[b] = t;
+                  }
+            static const int want_order[3] = {1, 2, 0};
+            if (nr == 3)
+               for (int k = 0; k < 3; k++)
+                  if (vh.box[rows[k]].arg - MA_DEV_PICK != want_order[k]) {
+                     printf("  FAIL: devlist row %d picks model %d, want %d "
+                            "-- the pick is indexing the sorted position, so "
+                            "the user taps one sensor and the app pairs "
+                            "another\n",
+                            k, vh.box[rows[k]].arg - MA_DEV_PICK,
+                            want_order[k]);
+                     fail = 1;
+                     break;
+                  }
+            printf(
+                "uitest: device picks index the model, not the sorted row\n");
+         }
+      }
+
+      /* THE KEY AT EACH GRID POSITION MUST CARRY ITS OWN CODE.
+       *
+       * Asserting only that the twelve digit codes are all PRESENT is satisfied
+       * by any permutation of them, so transposing two keys passed the whole
+       * suite. That is a wrong pairing code, and -- via the same keypad -- a
+       * wrong CALIBRATION value written to the sensor, which main.c calls the
+       * single most consequential write in the app. Positions are checked in
+       * reading order: the layout is 7 8 9 / 4 5 6 / 1 2 3 / 0 < OK. */
+      {
+         struct hits kh2;
+         struct screen km2               = set;
+         km2.scr                         = SCR_KEYPAD;
+         struct ANativeWindow_Buffer kb2 = {.width  = W,
+                                            .height = TALL_H,
+                                            .stride = W,
+                                            .format = 1,
+                                            .bits   = g_px};
+         ui_render(&kb2, &km2, &kh2);
+         static const int want[12] = {107, 108, 109, 104, 105, 106,
+                                      101, 102, 103, 100, 110, MA_OK};
+         int idx[64], n = 0;
+         for (int i = 0; i < kh2.n && n < 64; i++)
+            /* Keys only: MA_DIGIT(100..109), MA_BACKSPACE(110) and MA_OK(111).
+             * MA_KP_CLOSE(113) is the close band, not part of the grid. */
+            if (kh2.box[i].kind == ACT_MENU && kh2.box[i].arg >= 100 &&
+                kh2.box[i].arg <= MA_OK)
+               idx[n++] = i;
+         /* Sort the collected targets into reading order (row, then column). */
+         for (int a = 0; a < n; a++)
+            for (int b = a + 1; b < n; b++) {
+               int ia = idx[a], ib = idx[b];
+               int rowa = kh2.box[ia].y, rowb = kh2.box[ib].y;
+               if (rowb < rowa - 4 ||
+                   (rowb < rowa + 4 && kh2.box[ib].x < kh2.box[ia].x)) {
+                  int t  = idx[a];
+                  idx[a] = idx[b];
+                  idx[b] = t;
+               }
+            }
+         if (n != 12) {
+            printf("  FAIL: keypad recorded %d key targets, want 12\n", n);
+            fail = 1;
+         } else {
+            for (int k = 0; k < 12; k++)
+               if (kh2.box[idx[k]].arg != want[k]) {
+                  printf(
+                      "  FAIL: keypad position %d carries arg %d, want %d -- "
+                      "a transposed key means a wrong calibration value\n",
+                      k, kh2.box[idx[k]].arg, want[k]);
+                  fail = 1;
+                  break;
+               }
+         }
+         printf("uitest: keypad key positions carry their own codes\n");
+      }
+
+      /* A target smaller than a fingertip draws normally and cannot be hit. The
+       * degenerate check only catches w<=0/h<=0, so a 1-px-tall keypad key
+       * passed. */
+      {
+         struct hits kh;
+         struct screen km               = set;
+         km.scr                         = SCR_KEYPAD;
+         struct ANativeWindow_Buffer kb = {.width  = W,
+                                           .height = TALL_H,
+                                           .stride = W,
+                                           .format = 1,
+                                           .bits   = g_px};
+         ui_render(&kb, &km, &kh);
+         int tiny = 0;
+         for (int i = 0; i < kh.n; i++)
+            if (kh.box[i].kind == ACT_MENU &&
+                (kh.box[i].w < 8 || kh.box[i].h < 8))
+               tiny++;
+         if (tiny) {
+            printf("  FAIL: keypad has %d target(s) under 8 px -- draws but "
+                   "cannot realistically be tapped\n",
+                   tiny);
+            fail = 1;
+         }
+         printf("uitest: no sub-fingertip keypad targets\n");
+      }
+
+      /* EVERY MODAL MUST CARRY ITS OWN ESCAPE CODE, and ui_hit must return it.
+       *
+       * The existing dead-end sweep only checks that SOME box has w>0 and h>0
+       * -- it is kind- and arg-agnostic. So mis-wiring an escape control (X
+       * becomes ORIENTATION, cancel becomes ACT_NONE, back becomes PRIMARY)
+       * left the screen inescapable while the gate stayed green: on_input
+       * swallows every non-ACT_MENU tap while g_menu is set, and Android's back
+       * button destroys the activity rather than closing a menu, so those are
+       * force-stop-only states. Deleting an escape target was already caught;
+       * MIS-WIRING one was not. Probing through ui_hit rather than reading
+       * h.box[] also catches a later box that shadows the control. */
+      {
+         static const struct {
+            int scr;
+            int esc;
+            const char *name;
+         } esc[] = {
+             {SCR_SETTINGS, MA_CLOSE,       "SETTINGS"},
+             {SCR_KEYPAD,   MA_KP_CLOSE,    "KEYPAD"  },
+             {SCR_DEVLIST,  MA_DEV_CANCEL,  "DEVLIST" },
+             {SCR_SENSOR,   MA_SENSOR_BACK, "SENSOR"  },
+             {SCR_CAL,      MA_CAL_BACK,    "CAL"     },
+             {SCR_FORGET,   MA_FORGET_NO,   "FORGET"  },
+             {SCR_SENSTYPE, MA_SENSOR_BACK, "SENSTYPE"},
+             {SCR_LABEL,    MA_KP_CLOSE,    "LABEL"   },
+         };
+         struct ANativeWindow_Buffer eb = {.width  = W,
+                                           .height = TALL_H,
+                                           .stride = W,
+                                           .format = 1,
+                                           .bits   = g_px};
+         for (unsigned e = 0; e < sizeof esc / sizeof esc[0]; e++) {
+            struct hits eh;
+            struct screen em = set;
+            em.scr           = esc[e].scr;
+            em.sel           = 0;
+            ui_render(&eb, &em, &eh);
+            int found = -1;
+            for (int i = 0; i < eh.n; i++)
+               if (eh.box[i].kind == ACT_MENU && eh.box[i].arg == esc[e].esc &&
+                   eh.box[i].w > 0 && eh.box[i].h > 0)
+                  found = i;
+            if (found < 0) {
+               printf("  FAIL: %s records no working escape (want ACT_MENU arg "
+                      "%d) -- the screen cannot be left without a force stop\n",
+                      esc[e].name, esc[e].esc);
+               fail = 1;
+               continue;
+            }
+            /* And a tap at its centre must actually dispatch to it. */
+            int cx            = eh.box[found].x + eh.box[found].w / 2;
+            int cy            = eh.box[found].y + eh.box[found].h / 2;
+            struct action got = ui_hit(&eh, cx, cy);
+            if (got.kind != ACT_MENU || got.arg != esc[e].esc) {
+               printf("  FAIL: %s escape at (%d,%d) dispatches kind=%d arg=%d, "
+                      "want ACT_MENU %d -- something shadows the way out\n",
+                      esc[e].name, cx, cy, got.kind, got.arg, esc[e].esc);
+               fail = 1;
+            }
+         }
+         printf("uitest: every modal carries a dispatchable escape\n");
+      }
+
+      printf("uitest: all modal screens escapable with a stale selection\n");
+   }
+
+   /* --- out-of-range capping ---
+    *
+    * A reading above the scale must land EXACTLY on the plot_max gridline (and
+    * one below it exactly on the bottom line), never off the plot or on some
+    * arbitrary nearby row: an excursion has to stay visible AND sit on a row
+    * the axis labels actually explain. Asserted through plot_point_xy so this
+    * checks plot_render's own mapping rather than a re-derivation of it. */
+   {
+      const int px0 = 0, py0 = 0, pw = 100, ph = 60;
+      plot_set_max(300);
+      struct plot_pt at_max = {.t = 0, .glu = 300};
+      struct plot_pt over   = {.t = 0, .glu = 900};
+      struct plot_pt at_min = {.t = 0, .glu = 50};
+      struct plot_pt under  = {.t = 0, .glu = 10};
+      int ax, ay, ox, oy, nx, ny, ux, uy;
+      plot_point_xy(px0, py0, pw, ph, at_max, 0, 1, &ax, &ay);
+      plot_point_xy(px0, py0, pw, ph, over, 0, 1, &ox, &oy);
+      plot_point_xy(px0, py0, pw, ph, at_min, 0, 1, &nx, &ny);
+      plot_point_xy(px0, py0, pw, ph, under, 0, 1, &ux, &uy);
+      printf("uitest: cap at_max y=%d over y=%d | at_min y=%d under y=%d\n", ay,
+             oy, ny, uy);
+      if (ay != oy || ny != uy || oy != py0 + 1) {
+         printf(
+             "  FAIL: out-of-range readings not capped onto the gridlines\n");
+         fail = 1;
+      }
+      plot_set_max(m.plot_max); /* restore: later cases render real screens */
+   }
+
+   /* --- multi-sensor plot styling on the main screen ---
+    *
+    * Without this the harness only ever rendered SCR_MAIN with nsensors = 0,
+    * so the whole per-source styling path -- ui_sensor_color(), the
+    * non-primary branch, the orphan branch, and every mark() shape but the dot
+    * -- was dead code as far as the offline tests were concerned. */
+   {
+      struct ui_point mh[8] = {
+          {.t   = NOW - 100,
+           .glu = 148,
+           .src = 1                                }, /* primary CGM: value palette */
+          {.t   = NOW - 300,
+           .glu = 143,
+           .src = 2                                }, /* 2nd CGM: own colour+square */
+          {.t   = NOW - 600,
+           .glu = 205,
+           .src = 3                                }, /* meter: own colour+triangle */
+          {.t   = NOW - 900,
+           .glu = 132,
+           .src = 99                               }, /* forgotten sensor: orphan */
+          {.t = NOW - 1200,   .glu = 155, .src = 1 },
+          {.t = NOW - 1500,   .glu = 121, .src = 2 },
+          {.t = NOW - 1800,   .glu = 178, .src = 99},
+          {.t   = NOW - 2100,
+           .glu = 160,
+           .src = 0                                }, /* legacy: also value palette */
+      };
+      struct screen ms = m;
+      ms.now           = NOW;
+      ms.t             = NOW - 100;
+      ms.hist          = mh;
+      ms.nhist         = 8;
+      ms.sensors       = sens;
+      ms.nsensors      = 3;
+      ui_render(&tall, &ms, &h);
+      write_ppm_buf(&tall, "tmp/uitest/main_multi.ppm");
+      long c1   = count_color(&tall, ui_sensor_color(1)); /* sens[1] colour */
+      long c2   = count_color(&tall, ui_sensor_color(2)); /* sens[2] colour */
+      long orph = count_color(&tall, 0xFF8A8AA0);         /* UI_ORPHAN */
+      printf(
+          "uitest: multi-sensor plot px sensor1=%ld sensor2=%ld orphan=%ld\n",
+          c1, c2, orph);
+      if (c1 <= 0 || c2 <= 0) {
+         printf("  FAIL: non-primary sensors not drawn in their own colour\n");
+         fail = 1;
+      }
+      /* The orphan branch is what stops a forgotten sensor's readings being
+       * drawn as the live primary trace -- assert it actually fires. */
+      if (orph <= 0) {
+         printf("  FAIL: orphaned source not drawn in the muted colour\n");
+         fail = 1;
+      }
+      /* And with no registry at all, nothing may be styled as an orphan:
+       * pre-registry logs are legitimately the primary trace. */
+      ms.sensors  = 0;
+      ms.nsensors = 0;
+      ui_render(&tall, &ms, &h);
+      if (count_color(&tall, 0xFF8A8AA0) > 0) {
+         printf("  FAIL: orphan styling applied with an empty registry\n");
+         fail = 1;
+      }
+   }
+
+   /* --- per-sensor screen: attributes settable, actions present --- */
+   struct screen det = set;
+   det.scr           = SCR_SENSOR;
+   det.sel           = 0;
+   ui_render(&tall, &det, &h);
+   write_ppm_buf(&tall, "tmp/uitest/sensor.ppm");
+   {
+      int saw_primary = 0, saw_marker = 0, saw_color = 0, saw_cal = 0,
+          saw_forget = 0;
+      for (int i = 0; i < h.n; i++) {
+         if (h.box[i].kind != ACT_MENU)
+            continue;
+         saw_primary |= (h.box[i].arg == MA_PRIMARY);
+         saw_marker |= (h.box[i].arg == MA_MARKER);
+         saw_color |= (h.box[i].arg == MA_COLOR);
+         saw_cal |= (h.box[i].arg == MA_CAL_OPEN);
+         saw_forget |= (h.box[i].arg == MA_FORGET);
+      }
+      if (!(saw_primary && saw_marker && saw_color && saw_cal && saw_forget)) {
+         printf("  FAIL: sensor screen targets pri=%d mark=%d col=%d cal=%d "
+                "forget=%d\n",
+                saw_primary, saw_marker, saw_color, saw_cal, saw_forget);
+         fail = 1;
+      }
+   }
+   /* a BGM must offer SYNC NOW and must NOT offer calibration or PRIMARY */
+   det.sel = 2;
+   ui_render(&tall, &det, &h);
+   {
+      int saw_sync = 0, saw_cal = 0, saw_primary = 0;
+      for (int i = 0; i < h.n; i++) {
+         if (h.box[i].kind != ACT_MENU)
+            continue;
+         saw_sync |= (h.box[i].arg == MA_SYNC);
+         saw_cal |= (h.box[i].arg == MA_CAL_OPEN);
+         saw_primary |= (h.box[i].arg == MA_PRIMARY);
+      }
+      if (!saw_sync || saw_cal || saw_primary) {
+         printf("  FAIL: meter screen sync=%d cal=%d primary=%d "
+                "(want 1 0 0)\n",
+                saw_sync, saw_cal, saw_primary);
+         fail = 1;
+      }
+   }
+
+   /* --- forget confirmation: reachable, and offers both ways out --- */
+   struct screen fg = set;
+   fg.scr           = SCR_FORGET;
+   fg.sel           = 0;
+   ui_render(&tall, &fg, &h);
+   write_ppm_buf(&tall, "tmp/uitest/forget.ppm");
+   {
+      int saw_yes = 0, saw_no = 0;
+      for (int i = 0; i < h.n; i++) {
+         if (h.box[i].kind != ACT_MENU)
+            continue;
+         saw_yes |= (h.box[i].arg == MA_FORGET_YES);
+         saw_no |= (h.box[i].arg == MA_FORGET_NO);
+      }
+      if (!saw_yes || !saw_no) {
+         printf("  FAIL: forget confirm yes=%d no=%d\n", saw_yes, saw_no);
+         fail = 1;
+      }
+   }
+
+   /* --- meter discovery: the picker must list a OneTouch, not just Dexcoms ---
+    */
+   /* ui_dev.name is 12 bytes and the shell truncates into it (main.c uses
+    * str_snapshot / snprintf), so this literal must fit WITH its terminator.
+    * The real advert "OneTouch C0HD" is 13 chars and, written out in full
+    * here, left the array unterminated -- the renderer then read past it. */
+   struct ui_dev meters[1] = {
+       {"OneTouch C0", "F7:F0:20:2D:77:28", -58}
+   };
+   struct screen ml = {.scr = SCR_DEVLIST, .devs = meters, .ndev = 1};
+   ui_render(&tall, &ml, &h);
+   write_ppm_buf(&tall, "tmp/uitest/meterlist.ppm");
+   {
+      int picks = 0;
+      for (int i = 0; i < h.n; i++)
+         picks += (h.box[i].kind == ACT_MENU && h.box[i].arg >= MA_DEV_PICK);
+      if (picks != 1) {
+         printf("  FAIL: meter picker recorded %d picks, want 1\n", picks);
+         fail = 1;
+      }
+   }
+
+   /* --- rename keypad: every character reachable, plus DEL and OK --- */
+   struct screen lb = set;
+   lb.scr           = SCR_LABEL;
+   lb.sel           = 0;
+   lb.entry         = "KITCH";
+   ui_render(&tall, &lb, &h);
+   write_ppm_buf(&tall, "tmp/uitest/label.ppm");
+   {
+      int chars = 0, saw_del = 0, saw_ok = 0;
+      for (int i = 0; i < h.n; i++) {
+         if (h.box[i].kind != ACT_MENU)
+            continue;
+         if (h.box[i].arg >= MA_CHAR &&
+             h.box[i].arg < MA_CHAR + ui_label_nchars())
+            chars++;
+         saw_del |= (h.box[i].arg == MA_BACKSPACE);
+         saw_ok |= (h.box[i].arg == 111);
+      }
+      if (chars != ui_label_nchars() || !saw_del || !saw_ok) {
+         printf("  FAIL: rename keypad chars=%d/%d del=%d ok=%d\n", chars,
+                ui_label_nchars(), saw_del, saw_ok);
+         fail = 1;
+      }
+   }
+
+   /* --- calibration panel: blocked unless the firmware permits it --- */
+   struct screen cal = set;
+   cal.scr           = SCR_CAL;
+   cal.sel           = 0;
+   cal.cal_have      = 1;
+   cal.cal_permitted = 0;
+   cal.cal_result    = -1;
+   ui_render(&tall, &cal, &h);
+   {
+      int saw_enter = 0;
+      for (int i = 0; i < h.n; i++)
+         saw_enter |=
+             (h.box[i].kind == ACT_MENU && h.box[i].arg == MA_CAL_ENTER);
+      if (saw_enter) {
+         printf("  FAIL: ENTER VALUE tappable while not permitted\n");
+         fail = 1;
+      }
+   }
+   cal.cal_permitted = 1;
+   cal.cal_status    = 1;
+   cal.cal_last_bg   = 140;
+   ui_render(&tall, &cal, &h);
+   write_ppm_buf(&tall, "tmp/uitest/cal.ppm");
+   {
+      int saw_enter = 0;
+      for (int i = 0; i < h.n; i++)
+         saw_enter |=
+             (h.box[i].kind == ACT_MENU && h.box[i].arg == MA_CAL_ENTER);
+      if (!saw_enter) {
+         printf("  FAIL: ENTER VALUE not tappable while permitted\n");
+         fail = 1;
+      }
+   }
+
+   /* --- sensor-type picker offers every type --- */
+   struct screen st2 = {.scr = SCR_SENSTYPE, .sel = -1};
+   ui_render(&tall, &st2, &h);
+   write_ppm_buf(&tall, "tmp/uitest/senstype.ppm");
+   {
+      int types = 0;
+      for (int i = 0; i < h.n; i++)
+         if (h.box[i].kind == ACT_MENU && h.box[i].arg >= MA_TYPE &&
+             h.box[i].arg < MA_TYPE + SENSOR_NTYPES)
+            types++;
+      if (types != SENSOR_NTYPES - 1) {
+         printf("  FAIL: type picker offered %d types, want %d\n", types,
+                SENSOR_NTYPES - 1);
+         fail = 1;
+      }
    }
 
    /* --- first-run gate screen (CONTINUE button) --- */

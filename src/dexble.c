@@ -7,11 +7,14 @@
  * hooks via Ble's static methods and forwards Ble's callbacks into the driver.
  *
  * All driver work happens synchronously inside a native callback (or the pair
- * kickoff), each of which carries a JNIEnv; we stash it in cur_env for the
- * duration so the drv_* hooks can call back into Java without a thread attach.
+ * kickoff). Each transport call resolves a JNIEnv for ITS OWN thread via
+ * any_env(): GATT callbacks arrive on binder threads, and a JNIEnv is only
+ * valid on the thread that produced it, so one may never be stashed in a
+ * global and reused from another. Driver state is serialised by driver_lock().
  */
 #include "dexdriver.h"
 #include "dexlibc.h"
+#include "otble.h"
 #include "stealo.h"
 #include <jni.h>
 #include <jni_md.h>
@@ -23,16 +26,54 @@ int __android_log_print(int prio, const char *tag, const char *fmt, ...);
 static jclass g_ble;
 static jobject g_ctx;
 static jmethodID m_connect, m_subscribe, m_write, m_readrssi, m_read,
-    m_startsvc;
+    m_startsvc, m_disconnect;
 static char g_keypath[256];
 static char g_macpath[256];
-static JNIEnv *cur_env;
+
+/* Per-link key/MAC files. Several CGMs can be bonded at once, and each holds a
+ * different shared key -- a single stelo.key would have the second sensor
+ * silently overwrite the first's, dropping its bond. Link 0 keeps the historic
+ * unsuffixed names so an existing install is not orphaned by this change. */
+static const char *link_path(char *out, int cap, const char *base, int link)
+{
+   int i = 0;
+   while (base[i] && i < cap - 4) {
+      out[i] = base[i];
+      i++;
+   }
+   if (link != LINK_CGM) {
+      out[i++] = '.';
+      out[i++] = (char)('0' + (link % 10));
+   }
+   out[i] = 0;
+   return out;
+}
+
 static JavaVM *g_vm;       /* for a JNIEnv on any thread */
 static jclass g_alarm_cls; /* com.jk.stealo.Alarm */
-static jmethodID m_alarm_trigger, m_alarm_silence;
+static jmethodID m_alarm_trigger, m_alarm_silence, m_alarm_beep;
 
 /* a JNIEnv valid on the calling thread (main-loop touches and binder callbacks
  * both drive the alarm), attaching if necessary */
+static JNIEnv *any_env(void);
+
+/* Public wrapper: main.c needs a thread-correct env for the timezone lookup,
+ * which runs on a BLE binder thread during a meter import. */
+JNIEnv *dexble_env(void)
+{
+   return any_env();
+}
+
+/* The app Context, as a global ref that outlives the activity.
+ *
+ * main.c's notification path used g_act->clazz, which is NULL once the
+ * activity is destroyed -- so the one glucose display left to the user froze.
+ * This ref is created in dexble_register and never released. */
+jobject dexble_ctx(void)
+{
+   return g_ctx;
+}
+
 static JNIEnv *any_env(void)
 {
    JNIEnv *e = 0;
@@ -45,13 +86,22 @@ static JNIEnv *any_env(void)
    return 0;
 }
 
-void dexble_alarm(int kind, int sound, int vibrate)
+/* Returns 1 only if Java was actually reached.
+ *
+ * This was void, so failing to reach Alarm.trigger was invisible -- and
+ * alarm_apply had already committed the level as "announced", so its
+ * idempotence check suppressed every later attempt and the hypo stayed silent
+ * for its whole duration. That is precisely the failure the staged try/catch
+ * inside Alarm.java was written to eliminate, reintroduced one layer below
+ * where the staging cannot reach it. Reporting failure lets the caller decline
+ * to commit, so the level-based design self-corrects on the next tick. */
+int dexble_alarm(int kind, int sound, int vibrate)
 { /* kind: 0 low, 1 high, 2 stale */
    JNIEnv *e = any_env();
    if (!e || !g_alarm_cls || !m_alarm_trigger) {
       LOGI("alarm: cannot fire (e=%p cls=%p m=%p)", (void *)e,
            (void *)g_alarm_cls, (void *)m_alarm_trigger);
-      return;
+      return 0;
    }
    LOGI("alarm: fire trigger kind=%d sound=%d vib=%d", kind, sound, vibrate);
    (*e)->CallStaticVoidMethod(e, g_alarm_cls, m_alarm_trigger, g_ctx,
@@ -59,61 +109,155 @@ void dexble_alarm(int kind, int sound, int vibrate)
    if ((*e)->ExceptionCheck(e)) {
       LOGI("alarm: java threw");
       (*e)->ExceptionClear(e);
+      return 0;
    }
+   return 1;
 }
 
-void dexble_alarm_silence(void)
+/* One short beep (NEW DATAPOINT alert). Best-effort: a missed beep is harmless,
+ * unlike the glucose alarm. */
+void dexble_beep(void)
 {
    JNIEnv *e = any_env();
-   if (!e || !g_alarm_cls || !m_alarm_silence)
+   if (!e || !g_alarm_cls || !m_alarm_beep) {
+      LOGI("beep: not wired (e=%p cls=%p m=%p)", (void *)e, (void *)g_alarm_cls,
+           (void *)m_alarm_beep);
       return;
-   (*e)->CallStaticVoidMethod(e, g_alarm_cls, m_alarm_silence, g_ctx);
+   }
+   LOGI("beep: fire");
+   (*e)->CallStaticVoidMethod(e, g_alarm_cls, m_alarm_beep, g_ctx);
    if ((*e)->ExceptionCheck(e))
       (*e)->ExceptionClear(e);
 }
 
-/* ---- drv_* transport hooks (called by the driver, cur_env valid) ---- */
+/* Returns 1 only if Java was reached. Symmetric with dexble_alarm, and for the
+ * same reason: the callers commit the "silent" state BEFORE calling, so a
+ * silent no-op here leaves a looping USAGE_ALARM MediaPlayer running with
+ * g_alarm_want == AL_NONE (no later apply issues another silence) and
+ * g_alarm_sounding == 0 (every further tap falls through to the UI). That is
+ * an alarm that plays until the process dies -- the worst outcome in this
+ * file's own risk model. */
+int dexble_alarm_silence(void)
+{
+   JNIEnv *e = any_env();
+   if (!e || !g_alarm_cls || !m_alarm_silence)
+      return 0;
+   (*e)->CallStaticVoidMethod(e, g_alarm_cls, m_alarm_silence, g_ctx);
+   if ((*e)->ExceptionCheck(e))
+      (*e)->ExceptionClear(e);
+   return 1;
+}
+
+/* ---- drv_* transport hooks ---- */
 void drv_connect(const char *mac)
 {
-   JNIEnv *e = cur_env;
+   JNIEnv *e = any_env();
    if (!e)
       return;
-   jstring m   = (*e)->NewStringUTF(e, mac);
-   jstring err = (*e)->CallStaticObjectMethod(e, g_ble, m_connect, g_ctx, m);
+   /* NULL means OOM with an exception PENDING; the next JNI call on this thread
+    * would then be illegal (VM abort under CheckJNI). subscribe/write guard the
+    * same NewStringUTF pattern; connect -- reached on every pair/reconnect --
+    * did not. */
+   jstring m = (*e)->NewStringUTF(e, mac);
+   if (!m) {
+      if ((*e)->ExceptionCheck(e))
+         (*e)->ExceptionClear(e);
+      return;
+   }
+   jstring err = (*e)->CallStaticObjectMethod(e, g_ble, m_connect, g_ctx, m,
+                                              (jint)driver_link());
    if ((*e)->ExceptionCheck(e))
       (*e)->ExceptionClear(
           e); /* don't leave it pending for the next JNI call */
    (*e)->DeleteLocalRef(e, m);
    if (err) {
+      /* GetStringUTFChars can itself return NULL on OOM; s then flows into
+       * LOGI("%s") and stealo_status -> NULL deref. */
       const char *s = (*e)->GetStringUTFChars(e, err, 0);
-      LOGI("connect: %s", s);
-      stealo_status(s);
-      (*e)->ReleaseStringUTFChars(e, err, s);
+      if (s) {
+         LOGI("connect: %s", s);
+         stealo_status(s);
+         (*e)->ReleaseStringUTFChars(e, err, s);
+      }
       (*e)->DeleteLocalRef(e, err);
    }
 }
 
-void drv_subscribe(const char *uuid, int indicate)
+void dexble_subscribe(int link, const char *uuid, int indicate)
 {
-   JNIEnv *e = cur_env;
+   JNIEnv *e = any_env();
    if (!e)
       return;
+   /* NULL means OOM with an exception PENDING, and any further JNI call on a
+    * thread with a pending exception is illegal -- so the failure would not
+    * stay contained to this one operation. dexble_write already guards this
+    * exact pattern; subscribe and the devinfo reads did not. */
    jstring u = (*e)->NewStringUTF(e, uuid);
-   (*e)->CallStaticVoidMethod(e, g_ble, m_subscribe, u, (jboolean)indicate);
+   if (!u) {
+      if ((*e)->ExceptionCheck(e))
+         (*e)->ExceptionClear(e);
+      return;
+   }
+   (*e)->CallStaticVoidMethod(e, g_ble, m_subscribe, (jint)link, u,
+                              (jboolean)indicate);
    (*e)->DeleteLocalRef(e, u);
 }
 
-void drv_write(const char *uuid, const uint8_t *d, int n, int no_resp)
+void dexble_write(int link, const char *uuid, const uint8_t *d, int n,
+                  int no_resp)
 {
-   JNIEnv *e = cur_env;
+   JNIEnv *e = any_env();
    if (!e)
       return;
    jstring u    = (*e)->NewStringUTF(e, uuid);
    jbyteArray a = (*e)->NewByteArray(e, n);
+   /* Both allocations can fail under memory pressure, and SetByteArrayRegion
+    * on a NULL array ABORTS the VM rather than throwing. notify_update guards
+    * the identical pattern; this path did not. */
+   if (!u || !a) {
+      (*e)->ExceptionClear(e);
+      if (u)
+         (*e)->DeleteLocalRef(e, u);
+      if (a)
+         (*e)->DeleteLocalRef(e, a);
+      return;
+   }
    (*e)->SetByteArrayRegion(e, a, 0, n, (const jbyte *)d);
-   (*e)->CallStaticVoidMethod(e, g_ble, m_write, u, a, (jboolean)no_resp);
+   (*e)->CallStaticVoidMethod(e, g_ble, m_write, (jint)link, u, a,
+                              (jboolean)no_resp);
+   /* Leaving an exception pending makes the NEXT JNI call on this thread
+    * illegal; Ble.write's queue/link path is not wrapped in a catch-all. */
+   if ((*e)->ExceptionCheck(e))
+      (*e)->ExceptionClear(e);
    (*e)->DeleteLocalRef(e, u);
    (*e)->DeleteLocalRef(e, a);
+}
+
+/* The Dexcom driver owns LINK_CGM; these keep its existing hook names. */
+void drv_subscribe(const char *uuid, int indicate)
+{
+   dexble_subscribe(driver_link(), uuid, indicate);
+}
+
+void drv_write(const char *uuid, const uint8_t *d, int n, int no_resp)
+{
+   dexble_write(driver_link(), uuid, d, n, no_resp);
+}
+
+/* Drop the link now rather than waiting for the peer to time out. The meter
+ * driver needs this: holding a meter connected keeps it awake past its own
+ * auto-power-off and burns its coin cell for nothing. */
+void dexble_link_close(int link)
+{
+   JNIEnv *e = any_env();
+   if (!e || !m_disconnect)
+      return;
+   (*e)->CallStaticVoidMethod(e, g_ble, m_disconnect, (jint)link);
+   /* Clear rather than leave pending: this runs on a binder thread that will
+    * make further JNI calls, and a pending exception makes all of them
+    * illegal. */
+   if ((*e)->ExceptionCheck(e))
+      (*e)->ExceptionClear(e);
 }
 
 void drv_status(const char *s)
@@ -123,19 +267,34 @@ void drv_status(const char *s)
 
 static void ble_read_rssi(void)
 {
-   JNIEnv *e = cur_env;
+   JNIEnv *e = any_env();
    if (!e || !m_readrssi)
       return;
-   (*e)->CallStaticVoidMethod(e, g_ble, m_readrssi); /* result -> onRssi */
+   (*e)->CallStaticVoidMethod(e, g_ble, m_readrssi,
+                              (jint)driver_link()); /* result -> onRssi */
 }
 
 /* One-shot read of the Device Information Service (0x180A) strings the Stelo
  * actually exposes: model 0x2A24, firmware 0x2A26, manufacturer 0x2A29. (It has
  * no 0x2A25 serial / 0x2A28 software characteristic.) Results arrive on onRead.
  */
+/* Read the Device Information Service on an explicit link (the meter needs its
+ * own model/firmware recorded, not the CGM's). */
+void dexble_request_devinfo_link(int link)
+{
+   /* Under the lock, so swapping the driver's selected link cannot be observed
+    * by another thread mid-operation. */
+   driver_lock();
+   int drv = driver_link();
+   driver_select(link);
+   dexble_request_devinfo();
+   driver_select(drv);
+   driver_unlock();
+}
+
 void dexble_request_devinfo(void)
 {
-   JNIEnv *e = cur_env;
+   JNIEnv *e = any_env();
    if (!e || !m_read)
       return;
    static const char *uuids[3] = {
@@ -145,7 +304,13 @@ void dexble_request_devinfo(void)
    };
    for (int i = 0; i < 3; i++) {
       jstring u = (*e)->NewStringUTF(e, uuids[i]);
-      (*e)->CallStaticVoidMethod(e, g_ble, m_read, u); /* result -> onRead */
+      if (!u) {
+         if ((*e)->ExceptionCheck(e))
+            (*e)->ExceptionClear(e);
+         return;
+      }
+      (*e)->CallStaticVoidMethod(e, g_ble, m_read, (jint)driver_link(),
+                                 u); /* result -> onRead */
       (*e)->DeleteLocalRef(e, u);
    }
 }
@@ -155,6 +320,11 @@ void drv_glucose(int mg, int trend, int age)
    stealo_glucose(mg, trend, age);
 }
 
+void drv_cal_result(int result)
+{
+   stealo_cal_result(result);
+}
+
 void drv_backfill(int mg, int trend, int age)
 {
    stealo_backfill(mg, trend, age);
@@ -162,7 +332,9 @@ void drv_backfill(int mg, int trend, int age)
 
 int drv_key_load(uint8_t key[16])
 {
-   int fd = open(g_keypath, O_RDONLY);
+   char pth[264];
+   int fd =
+       open(link_path(pth, sizeof pth, g_keypath, driver_link()), O_RDONLY);
    if (fd < 0)
       return 0;
    int ok = (read(fd, key, 16) == 16);
@@ -172,7 +344,9 @@ int drv_key_load(uint8_t key[16])
 
 void drv_key_save(const uint8_t key[16])
 {
-   int fd = open(g_keypath, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+   char pth[264];
+   int fd = open(link_path(pth, sizeof pth, g_keypath, driver_link()),
+                 O_WRONLY | O_CREAT | O_TRUNC, 0600);
    if (fd >= 0) {
       if (write(fd, key, 16) != 16) {
       }
@@ -182,14 +356,17 @@ void drv_key_save(const uint8_t key[16])
 
 void drv_key_clear(void)
 {
-   unlink(g_keypath);
+   char pth[264];
+   unlink(link_path(pth, sizeof pth, g_keypath, driver_link()));
 } /* stale key: force a fresh pairing */
 
 /* Persist the bonded sensor's MAC next to the key, so after a restart we
  * reconnect ONLY to that exact sensor (never grab another Dexcom in range). */
 int drv_mac_load(char *mac, int n)
 {
-   int fd = open(g_macpath, O_RDONLY);
+   char pth[264];
+   int fd =
+       open(link_path(pth, sizeof pth, g_macpath, driver_link()), O_RDONLY);
    if (fd < 0)
       return 0;
    long r = read(fd, mac, (unsigned)(n - 1));
@@ -202,7 +379,9 @@ int drv_mac_load(char *mac, int n)
 
 void drv_mac_save(const char *mac)
 {
-   int fd = open(g_macpath, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+   char pth[264];
+   int fd = open(link_path(pth, sizeof pth, g_macpath, driver_link()),
+                 O_WRONLY | O_CREAT | O_TRUNC, 0600);
    if (fd >= 0) {
       int len = 0;
       while (mac[len])
@@ -215,74 +394,161 @@ void drv_mac_save(const char *mac)
 
 void drv_mac_clear(void)
 {
-   unlink(g_macpath);
+   char pth[264];
+   unlink(link_path(pth, sizeof pth, g_macpath, driver_link()));
 }
 
 /* ---- Ble.java callbacks (each stashes its env, then drives the state machine)
  * ---- */
-static void jni_connected(JNIEnv *e, jclass c)
+/* Which protocol owns each link. The link id -- not the characteristic -- is
+ * the routing key, so two sensors that share a GATT layout (Stelo and G7 do)
+ * can be connected at once without their events being confused. */
+static void jni_connected(JNIEnv *e, jclass c, jint link)
 {
    (void)c;
-   cur_env = e;
-   driver_on_connected();
-   ble_read_rssi();
-   cur_env = 0;
+   (void)e;
+   driver_lock();
+   if (link == LINK_METER) {
+      ot_on_connected();
+      /* Sample the meter's link RSSI now -- it is only connected during a sync,
+       * so this brief window is the one chance. Read LINK_METER explicitly
+       * (ble_read_rssi() targets driver_link(), which is not the meter here);
+       * the result returns via onRssi -> jni_rssi -> stealo_meter_rssi. */
+      if (e && m_readrssi)
+         (*e)->CallStaticVoidMethod(e, g_ble, m_readrssi, (jint)LINK_METER);
+   } else {
+      driver_select(link);
+      driver_on_connected();
+      ble_read_rssi();
+   }
+   driver_unlock();
 }
 
-static void jni_disconnected(JNIEnv *e, jclass c, jint s)
+static void jni_disconnected(JNIEnv *e, jclass c, jint link, jint s)
 {
    (void)c;
-   cur_env = e;
-   driver_on_disconnected(s);
-   cur_env = 0;
+   (void)e;
+   driver_lock();
+   if (link == LINK_METER) {
+      ot_on_disconnected();
+   } else {
+      driver_select(link);
+      driver_on_disconnected(s);
+   }
+   driver_unlock();
 }
 
-static void jni_written(JNIEnv *e, jclass c, jstring ju, jint s)
+static void jni_written(JNIEnv *e, jclass c, jint link, jstring ju, jint s)
 {
    (void)c;
-   cur_env       = e;
+   (void)e;
    const char *u = (*e)->GetStringUTFChars(e, ju, 0);
-   driver_on_written(u, s);
+   if (!u) { /* OOM, exception pending -- u would NULL-deref in strcmp */
+      (*e)->ExceptionClear(e);
+      return;
+   }
+   /* The meter driver is request/response and drives itself off notifications,
+    * so a write ack needs no action there. */
+   if (link != LINK_METER) {
+      driver_lock();
+      driver_select(link);
+      driver_on_written(u, s);
+      driver_unlock();
+   }
    (*e)->ReleaseStringUTFChars(e, ju, u);
-   cur_env = 0;
 }
 
-static void jni_notify(JNIEnv *e, jclass c, jstring ju, jbyteArray jd)
+static void jni_notify(JNIEnv *e, jclass c, jint link, jstring ju,
+                       jbyteArray jd)
 {
    (void)c;
-   cur_env       = e;
+   (void)e;
    const char *u = (*e)->GetStringUTFChars(e, ju, 0);
-   jsize n       = (*e)->GetArrayLength(e, jd);
+   /* NULL means OOM with an exception pending. u goes straight into
+    * driver_on_notify, whose first act is strcmp(uuid, ...) -- a NULL deref on
+    * a BLE thread. jni_on_advert already guards exactly this. */
+   if (!u) {
+      (*e)->ExceptionClear(e);
+      return;
+   }
+   jsize n = jd ? (*e)->GetArrayLength(e, jd) : 0;
    uint8_t buf[256];
    if (n > 256)
       n = 256;
-   (*e)->GetByteArrayRegion(e, jd, 0, n, (jbyte *)buf);
-   driver_on_notify(u, buf, n);
+   if (n > 0)
+      (*e)->GetByteArrayRegion(e, jd, 0, n, (jbyte *)buf);
+   driver_lock();
+   if (link == LINK_METER) {
+      ot_on_notify(buf, n);
+   } else {
+      driver_select(link);
+      driver_on_notify(u, buf, n);
+   }
+   driver_unlock();
+   /* Evaluate the alarm here -- on this BLE thread, but only AFTER the driver
+    * lock is released.
+    *
+    * It cannot go inside the dispatch: Alarm.trigger blocks for hundreds of
+    * milliseconds and driver_lock is a no-timeout spin lock the main looper
+    * also takes. It must not be left to the UI timer either: that timer lives
+    * on the ACTIVITY's looper and is destroyed on back-press or task-swipe,
+    * while the foreground service keeps this transport running for days -- so
+    * a hypo would be decoded and logged with no sound, no vibration, and no
+    * way to silence one already ringing. Alarms must not depend on a visible
+    * activity. */
+   stealo_alarm_check();
    (*e)->ReleaseStringUTFChars(e, ju, u);
-   cur_env = 0;
 }
 
-static void jni_rssi(JNIEnv *e, jclass c, jint rssi)
+/* Service heartbeat. The stale-data alarm is triggered by the ABSENCE of
+ * readings, so something must evaluate it on a timer -- and that timer cannot
+ * live on the activity's looper, which is destroyed on back-press while the
+ * foreground service keeps running. */
+static void jni_tick(JNIEnv *e, jclass c)
 {
    (void)e;
    (void)c;
-   stealo_rssi(rssi);
+   stealo_alarm_check();
+   /* Keep the lock-screen notification tracking readings too: it is the only
+    * glucose display left once the activity is gone. */
+   stealo_notify_refresh();
+   /* Also repair stranded links. on_timer does this too, but on_timer lives on
+    * the ACTIVITY's looper and dies with it, while this service tick is
+    * designed to outlive the activity by days -- which is exactly the window
+    * in which a stranded link would otherwise never be reconnected. */
+   stealo_link_watchdog();
+   meter_sync_watchdog();
+   stealo_reconcile_tick();
 }
 
-static void jni_read(JNIEnv *e, jclass c, jstring ju, jbyteArray jd)
+static void jni_rssi(JNIEnv *e, jclass c, jint link, jint rssi)
+{
+   (void)e;
+   (void)c;
+   if (link != LINK_METER)
+      stealo_rssi(rssi);
+   else
+      stealo_meter_rssi(rssi); /* meter's last-sync signal strength */
+}
+
+static void jni_read(JNIEnv *e, jclass c, jint link, jstring ju, jbyteArray jd)
 {
    (void)c;
-   cur_env       = e;
+   (void)e;
    const char *u = (*e)->GetStringUTFChars(e, ju, 0);
-   jsize n       = (*e)->GetArrayLength(e, jd);
+   if (!u) {
+      (*e)->ExceptionClear(e);
+      return;
+   }
+   jsize n = jd ? (*e)->GetArrayLength(e, jd) : 0;
    char buf[64];
    if (n > 63)
       n = 63;
-   (*e)->GetByteArrayRegion(e, jd, 0, n, (jbyte *)buf);
+   if (n > 0)
+      (*e)->GetByteArrayRegion(e, jd, 0, n, (jbyte *)buf);
    buf[n < 0 ? 0 : n] = 0;
-   stealo_devinfo(u, buf);
+   stealo_devinfo(link, u, buf);
    (*e)->ReleaseStringUTFChars(e, ju, u);
-   cur_env = 0;
 }
 
 /* ---- public API (called from main.c) ---- */
@@ -313,17 +579,19 @@ int dexble_register(JNIEnv *e, jclass ble, jobject ctx)
     * in mutable arrays so no const is cast away (-Wcast-qual +
     * -Wwrite-strings). */
    static char n0[]                 = "onConnected";
-   static char s0[]                 = "()V";
+   static char s0[]                 = "(I)V";
    static char n1[]                 = "onDisconnected";
-   static char s1[]                 = "(I)V";
+   static char s1[]                 = "(II)V";
    static char n2[]                 = "onNotify";
-   static char s2[]                 = "(Ljava/lang/String;[B)V";
+   static char s2[]                 = "(ILjava/lang/String;[B)V";
    static char n3[]                 = "onWritten";
-   static char s3[]                 = "(Ljava/lang/String;I)V";
+   static char s3[]                 = "(ILjava/lang/String;I)V";
    static char n4[]                 = "onRssi";
-   static char s4[]                 = "(I)V";
+   static char s4[]                 = "(II)V";
    static char n5[]                 = "onRead";
-   static char s5[]                 = "(Ljava/lang/String;[B)V";
+   static char s5[]                 = "(ILjava/lang/String;[B)V";
+   static char n6[]                 = "onTick";
+   static char s6[]                 = "()V";
    static const JNINativeMethod m[] = {
        {n0, s0, (void *)jni_connected   },
        {n1, s1, (void *)jni_disconnected},
@@ -331,25 +599,38 @@ int dexble_register(JNIEnv *e, jclass ble, jobject ctx)
        {n3, s3, (void *)jni_written     },
        {n4, s4, (void *)jni_rssi        },
        {n5, s5, (void *)jni_read        },
+       {n6, s6, (void *)jni_tick        },
    };
-   if ((*e)->RegisterNatives(e, ble, m, 6) != 0)
+   if ((*e)->RegisterNatives(e, ble, m, 7) != 0)
       return 0;
    m_connect = (*e)->GetStaticMethodID(
        e, ble, "connect",
-       "(Landroid/content/Context;Ljava/lang/String;)Ljava/lang/String;");
+       "(Landroid/content/Context;Ljava/lang/String;I)Ljava/lang/String;");
    m_subscribe =
-       (*e)->GetStaticMethodID(e, ble, "subscribe", "(Ljava/lang/String;Z)V");
+       (*e)->GetStaticMethodID(e, ble, "subscribe", "(ILjava/lang/String;Z)V");
    m_write =
-       (*e)->GetStaticMethodID(e, ble, "write", "(Ljava/lang/String;[BZ)V");
-   m_readrssi = (*e)->GetStaticMethodID(e, ble, "readRssi", "()V");
-   m_read = (*e)->GetStaticMethodID(e, ble, "read", "(Ljava/lang/String;)V");
+       (*e)->GetStaticMethodID(e, ble, "write", "(ILjava/lang/String;[BZ)V");
+   m_readrssi   = (*e)->GetStaticMethodID(e, ble, "readRssi", "(I)V");
+   m_disconnect = (*e)->GetStaticMethodID(e, ble, "disconnect", "(I)V");
+   /* A missed method id leaves a pending NoSuchMethodError; making any further
+    * JNI call with one pending is illegal and aborts under CheckJNI. Clear it
+    * here so a lookup failure degrades to a null id instead of taking the
+    * process down on the next call. */
+   if ((*e)->ExceptionCheck(e))
+      (*e)->ExceptionClear(e);
+   m_read = (*e)->GetStaticMethodID(e, ble, "read", "(ILjava/lang/String;)V");
    m_startsvc = (*e)->GetStaticMethodID(e, ble, "startService",
                                         "(Landroid/content/Context;)V");
    if (m_startsvc)
       (*e)->CallStaticVoidMethod(e, g_ble, m_startsvc,
                                  g_ctx); /* keep alive in bg */
    (*e)->GetJavaVM(e, &g_vm);
-   return m_connect && m_subscribe && m_write && m_readrssi && m_read;
+   /* Every id we will later call, not just most of them: a missing
+    * m_disconnect would leave dexble_link_close a silent no-op, holding a
+    * meter awake past its own power-off -- the one thing otble.h says must
+    * never happen. */
+   return m_connect && m_subscribe && m_write && m_readrssi && m_read &&
+          m_disconnect && m_startsvc;
 }
 
 /* Wire the Alarm class. FindClass here would resolve via the framework loader,
@@ -366,20 +647,46 @@ void dexble_set_alarm(JNIEnv *e, jclass alarm_cls)
                                              "(Landroid/content/Context;IZZ)V");
    m_alarm_silence = (*e)->GetStaticMethodID(e, alarm_cls, "silence",
                                              "(Landroid/content/Context;)V");
+   m_alarm_beep    = (*e)->GetStaticMethodID(e, alarm_cls, "beep",
+                                             "(Landroid/content/Context;)V");
    LOGI("alarm class wired (trigger=%p silence=%p)", (void *)m_alarm_trigger,
         (void *)m_alarm_silence);
 }
 
-void dexble_pair(JNIEnv *e, const char *mac, const char *code)
+void dexble_pair(int link, const char *mac, const char *code)
 {
-   cur_env = e;
+   driver_lock();
+   driver_select(link);
    driver_start(mac, code);
-   cur_env = 0;
+   driver_unlock();
 }
 
-void dexble_reconnect(JNIEnv *e)
-{ /* stall watchdog: force a fresh connect */
-   cur_env = e;
+/* Open the meter's link. It is a plain connect: the meter driver takes over
+ * from onConnected and tears the link down itself when it is finished. */
+void dexble_meter_connect(const char *mac)
+{
+   /* Select the meter's link only for the duration of the connect, under the
+    * lock, so a concurrent CGM reconnect cannot observe the swap and route a
+    * sensor into the meter's protocol driver. */
+   driver_lock();
+   int drv = driver_link();
+   driver_select(LINK_METER);
+   drv_connect(mac);
+   driver_select(drv);
+   driver_unlock();
+}
+
+void dexble_reconnect(int link)
+{ /* stall watchdog: force a fresh connect on a SPECIFIC link */
+   driver_lock();
+   /* Select explicitly. driver_kick() acts on the ambient context, and the GATT
+    * callbacks select without restoring -- so with a second sensor or a meter
+    * sync in flight this kicked whichever link a binder thread last touched,
+    * spuriously reconnecting a healthy link while leaving the stalled one
+    * stranded until the next throttle window. */
+   int prev = driver_link();
+   driver_select(link);
    driver_kick();
-   cur_env = 0;
+   driver_select(prev);
+   driver_unlock();
 }

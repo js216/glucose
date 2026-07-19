@@ -23,6 +23,9 @@ long read(int fd, void *buf, size_t n);
 long write(int fd, const void *buf, size_t n);
 int close(int fd);
 int unlink(const char *path);
+int rename(const char *from, const char *to);
+int ftruncate(int fd, long len);
+int sched_yield(void);
 long lseek(int fd, long off, int whence);
 int gettid(void); /* kernel thread id (tell the main looper from BLE threads) */
 #ifndef O_RDONLY

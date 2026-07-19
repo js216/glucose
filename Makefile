@@ -44,10 +44,18 @@ build/stub/lib%.so: src/stub_%.c
 
 # native sources: UI/JNI core, BLE transport, protocol driver, self-contained crypto
 SRC := src/main.c src/font.c src/plot.c src/util.c src/stats.c src/store.c src/settings.c src/ui.c \
+       src/alarmlogic.c src/scanlogic.c \
+       src/sensors.c src/otble.c \
        src/dexble.c src/dexdriver.c \
        src/dexauth.c src/dexdata.c src/p256.c src/sha256.c src/aes.c
 
-$(LIB): $(SRC) $(STUBS)
+# Headers are prerequisites too: the whole app is one clang invocation, so
+# there is no incremental build to lose, and without this a header-only edit
+# (this tree changed three struct layouts) silently relinks nothing and ships
+# the previous .so.
+HDR := $(wildcard src/*.h)
+
+$(LIB): $(SRC) $(HDR) $(STUBS)
 	@mkdir -p $(@D)
 	$(CLANG) --target=$(TARGET) $(CFLAGS) -shared -nostdlib -fuse-ld=lld \
 	    -Wl,--no-undefined -Lbuild/stub -lc -landroid -llog -o $@ $(SRC)
@@ -131,13 +139,29 @@ clean:
 # clean, and clang-tidy clean (rules in .clang-tidy, warnings-as-errors). No
 # compilation database is needed — the whole app is one clang invocation, so we
 # hand clang-tidy the exact compile flags after `--`.
-FMT_SRC   := $(wildcard src/*.c src/*.h)
+# test/ IS the behavioural gate, so it gets the same formatting and encoding
+# checks as src/. It was excluded, which meant the ~1400 lines that decide
+# whether every other check means anything could rot unnoticed.
+FMT_SRC   := $(wildcard src/*.c src/*.h test/*.c)
 TIDY_ARGS := --target=$(TARGET) -ffreestanding $(JNI_INC)
 
-check: format tidy done
+# uitest and drivertest are part of the gate: `make check` alone runs neither,
+# and both have caught defects that clang-tidy structurally cannot see (gcc's
+# -Wformat-truncation, and every protocol/crypto path).
+# $(LIB) and $(DEX) are gate dependencies, NOT incidental build products.
+#
+# Without them `make check` never compiled main.c with the project's own WARN
+# set and never compiled the Java at all -- so a green check did not mean the
+# APK builds. Proven by an adversarial probe: an unused variable added to
+# main.c passed the entire gate and failed only the library link, and
+# appending garbage to Alarm.java left the gate green as well. That left every
+# one of the 14 -Werror flags ungated across ~3900 lines of main.c, and the
+# whole alarm actuation end (Alarm.java, StealoService.java, Ble.java)
+# unchecked by anything.
+check: format tidy crosscheck javacheck $(LIB) $(DEX) uitest drivertest alarmtest storetest statstest metertest registrytest settingstest scantest done
 
 format:
-	grep -rlP '\r' --exclude='.*' src res Makefile AndroidManifest.xml \
+	grep -rlP '\r' --exclude='.*' src test res Makefile AndroidManifest.xml \
 		&& { echo "CRLF line endings found (see above)"; exit 1; } || true
 	grep -rlP '[^\x00-\x7F]' $(FMT_SRC) \
 		&& { echo "Non-ASCII characters found (see above)"; exit 1; } || true
@@ -145,6 +169,75 @@ format:
 
 format-fix:
 	clang-format -i $(FMT_SRC)
+
+# test/ is deliberately NOT in the tidy set, and that is a decision, not an
+# oversight. The blocker is not one or two fixable diagnostics -- it is that
+# TIDY_ARGS is the wrong toolchain for these files:
+#   - TIDY_ARGS says --target=aarch64-linux-android29 -ffreestanding, but the
+#     test programs are HOST binaries that use FILE, fopen, fprintf, perror and
+#     exit. Under those flags none of that resolves, so tidy emits hard
+#     clang-diagnostic-errors before reaching any real check. Tidying test/
+#     would need its own flag set, not an addition to this one.
+#   - On top of that, misc-use-internal-linkage wants main() static (a hosted
+#     entry point cannot be) and wants the __android_log_print stub static,
+#     when that stub exists precisely to satisfy calls from OTHER translation
+#     units (store.c, stats.c) -- verified empirically: making it static fails
+#     the build. Neither is suppressible without editing .clang-tidy, which is
+#     off limits.
+#   - And ~90 further diagnostics fire in the older test files (hicpp-signed-
+#     bitwise x51, readability-isolate-declaration x10, and others).
+# So test/ gets the format, CRLF and non-ASCII checks (see FMT_SRC, which does
+# include it) and the compiler's own -Wall -Wextra -Werror via TESTWARN, but
+# not clang-tidy. Doing it properly is a separate piece of work with a separate
+# flag set; do not expect the two named fixes above to open the door.
+# Constants that must agree ACROSS LANGUAGES. A _Static_assert cannot see Java,
+# so nothing else can catch this: raise LINK_MAX without raising MAX_LINKS and
+# Ble.link(id) returns null for the new link, silently dropping every GATT
+# operation on it -- no exception, no log, no diagnostic on either side.
+crosscheck:
+	@c=$$(grep -oP '#define LINK_MAX\s+\K[0-9]+' src/dexdriver.h); \
+	 j=$$(grep -oP 'MAX_LINKS\s*=\s*\K[0-9]+' src/Ble.java); \
+	 if [ -z "$$c" ] || [ -z "$$j" ]; then \
+	   echo "crosscheck: could not read LINK_MAX ('$$c') or MAX_LINKS ('$$j')"; \
+	   echo "  the check compares two greps; if BOTH miss it would pass on \"\" == \"\"."; \
+	   exit 1; \
+	 fi; \
+	 if [ "$$c" != "$$j" ]; then \
+	   echo "LINK_MAX ($$c in dexdriver.h) != MAX_LINKS ($$j in Ble.java):"; \
+	   echo "  every GATT op on a link above $$j would be silently dropped."; \
+	   exit 1; \
+	 fi; \
+	 printf '\033[1;32mcrosscheck\033[0m: LINK_MAX == MAX_LINKS (%s)\n' "$$c"
+
+# A STOPGAP, and labelled as one. There is no Java test binary -- Ble, Alarm and
+# StealoService are almost entirely Android API calls, so exercising them needs
+# a device or Robolectric. javac + d8 therefore gate syntax and types only, and
+# an adversarial review proved two severe mutants survive the whole check:
+# Alarm.silence() made a no-op (the C side records the alarm as dismissed while
+# the MediaPlayer keeps looping -- a hypo that rings and cannot be silenced),
+# and Ble.stop() unconditionally reporting success (duplicate scan clients,
+# which is what stop_scan's retry logic exists to prevent).
+#
+# These are pattern checks on load-bearing lines, not behaviour. They are worth
+# having because the alternative here is nothing at all, but they only pin the
+# specific shapes that were proven to slip through -- do not mistake them for
+# coverage.
+javacheck:
+	@f=src/Alarm.java; \
+	 grep -q 'static synchronized void silence' $$f || \
+	   { echo "$$f: silence() must stay synchronized"; exit 1; }; \
+	 awk '/static synchronized void silence/,/^    \}/' $$f | grep -q 'stopSound()' || \
+	   { echo "$$f: silence() must call stopSound() -- without it the C side"; \
+	     echo "  records the alarm dismissed while the player keeps looping"; \
+	     exit 1; }; \
+	 awk '/static void stopSound/,/^    \}/' $$f | grep -q 'release()' || \
+	   { echo "$$f: stopSound() must release() the player"; exit 1; }; \
+	 g=src/Ble.java; \
+	 awk '/static boolean stop\(/,/^    \}/' $$g | grep -q 'stopScan' || \
+	   { echo "$$g: stop() must actually call stopScan -- reporting success"; \
+	     echo "  without it lets the self-heal stack a second scan client"; \
+	     exit 1; }; \
+	 printf '\033[1;32mjavacheck\033[0m: load-bearing Java lines present\n'
 
 tidy:
 	clang-tidy $(SRC) -- $(TIDY_ARGS)
@@ -157,9 +250,130 @@ done:
 # -iquote so "" project headers come from src/ while <> headers stay glibc's
 # (the freestanding shims lack FILE/fopen etc. the harness needs on the host).
 JVM_INC := -I/usr/lib/jvm/default-java/include -I/usr/lib/jvm/default-java/include/linux
+# The harness built with only -Wall -Wextra and no -Werror, so it emitted live
+# -Wformat-truncation warnings (a real one-character label truncation) and still
+# passed. gcc catches truncation that clang-tidy does not, so this is the only
+# gate that sees it -- it has to be fatal.
+# -O2 is REQUIRED, not an optimisation choice: gcc only runs
+# -Wformat-truncation / -Wformat-overflow / -Wstringop-* / -Wmaybe-uninitialized
+# under optimisation. Without it this gate emitted ZERO truncation diagnostics
+# and the -Werror was decorative -- a genuinely truncating snprintf shipped as
+# silently as before. Clang (the real -Os build) does not implement the warning
+# at all, so this is the only place in the project that can see it.
+TESTWARN := -Wall -Wextra -Werror -Wformat=2 -O2
 uitest:
 	@mkdir -p tmp/uitest
-	cc -iquote src $(JVM_INC) -Wall -Wextra test/uitest.c src/ui.c src/font.c src/plot.c -o tmp/uitest/uitest
+	cc -iquote src $(JVM_INC) $(TESTWARN) test/uitest.c src/ui.c src/font.c \
+	    src/plot.c src/sensors.c src/util.c -o tmp/uitest/uitest
 	./tmp/uitest/uitest
 
-.PHONY: FORCE all release aab install run uninstall clean check format format-fix tidy done uitest
+# Behavioural gate for the alarm decision logic. Until this existed, NOTHING in
+# main.c was covered by any test binary -- an adversarial review deleted the
+# glucose alarm outright and `make check` stayed green. The LOW alarm was in
+# fact dead at the time (see alarmlogic.h).
+alarmtest:
+	@mkdir -p tmp/uitest
+	cc -iquote src $(TESTWARN) test/alarmtest.c src/alarmlogic.c -o tmp/uitest/alarmtest
+	@./tmp/uitest/alarmtest > tmp/uitest/alarmtest.log 2>&1 \
+	    && grep -q "ALL ALARM TESTS PASSED" tmp/uitest/alarmtest.log \
+	    && printf '\033[1;32malarmtest\033[0m: alarm decision logic OK\n' \
+	    || { cat tmp/uitest/alarmtest.log; exit 1; }
+
+# Behavioural gate for the reading history / dedup model. store.c was in no
+# test binary, and every caller persists only on a non-zero hist_insert result
+# -- so a wrong return there drops a reading permanently and silently.
+storetest:
+	@mkdir -p tmp/uitest
+	cc -iquote src $(TESTWARN) test/storetest.c src/store.c src/util.c \
+	    src/sensors.c -o tmp/uitest/storetest
+	@./tmp/uitest/storetest > tmp/uitest/storetest.log 2>&1 \
+	    && grep -q "ALL STORE TESTS PASSED" tmp/uitest/storetest.log \
+	    && printf '\033[1;32mstoretest\033[0m: history + dedup model OK\n' \
+	    || { cat tmp/uitest/storetest.log; exit 1; }
+
+# Behavioural gate for the rolling TIR/average buckets. The ring aliases an
+# over-old reading onto a live bucket and ZEROES it, so the boundary guards are
+# the whole safety of the statistics -- and they are exactly what a hand-check
+# reads past.
+statstest:
+	@mkdir -p tmp/uitest
+	cc -iquote src $(TESTWARN) test/statstest.c src/stats.c src/util.c \
+	    -o tmp/uitest/statstest
+	@./tmp/uitest/statstest > tmp/uitest/statstest.log 2>&1 \
+	    && grep -q "ALL STATS TESTS PASSED" tmp/uitest/statstest.log \
+	    && printf '\033[1;32mstatstest\033[0m: rolling TIR/average OK\n' \
+	    || { cat tmp/uitest/statstest.log; exit 1; }
+
+# Behavioural gate for the OneTouch meter driver, which had none. It decides
+# which fingersticks reach the append-only log, and its timestamp gate, its
+# walk-advance rule and its counter handling have all been wrong at some point.
+metertest:
+	@mkdir -p tmp/uitest
+	cc -iquote src $(TESTWARN) test/metertest.c src/otble.c src/util.c \
+	    -o tmp/uitest/metertest
+	@./tmp/uitest/metertest > tmp/uitest/metertest.log 2>&1 \
+	    && grep -q "ALL METER TESTS PASSED" tmp/uitest/metertest.log \
+	    && printf '\033[1;32mmetertest\033[0m: OneTouch meter driver OK\n' \
+	    || { cat tmp/uitest/metertest.log; exit 1; }
+
+# Behavioural gate for the provenance registry. An id names one physical device
+# forever and readings.csv cites those ids in rows that are never rewritten, so
+# an id reused is one sensor's history permanently merged into another's.
+# sensors.c was linked into other test binaries but nothing called mint, claim,
+# forget or rebind.
+registrytest:
+	@mkdir -p tmp/uitest
+	cc -iquote src $(TESTWARN) test/registrytest.c src/sensors.c src/util.c \
+	    -o tmp/uitest/registrytest
+	@./tmp/uitest/registrytest > tmp/uitest/registrytest.log 2>&1 \
+	    && grep -q "ALL REGISTRY TESTS PASSED" tmp/uitest/registrytest.log \
+	    && printf '\033[1;32mregistrytest\033[0m: provenance registry OK\n' \
+	    || { cat tmp/uitest/registrytest.log; exit 1; }
+
+# Behavioural gate for settings persistence. alarm_load's validation is the
+# last thing standing between a corrupt file and a hypo alarm that cannot fire
+# (an out-of-range low disables it; low > high latches both) -- while still
+# accepting low == high, which alarm_step legitimately produces.
+settingstest:
+	@mkdir -p tmp/uitest
+	cc -iquote src $(TESTWARN) test/settingstest.c src/settings.c src/util.c \
+	    -o tmp/uitest/settingstest
+	@./tmp/uitest/settingstest > tmp/uitest/settingstest.log 2>&1 \
+	    && grep -q "ALL SETTINGS TESTS PASSED" tmp/uitest/settingstest.log \
+	    && printf '\033[1;32msettingstest\033[0m: settings persistence OK\n' \
+	    || { cat tmp/uitest/settingstest.log; exit 1; }
+
+# Behavioural gate for the scan-lifecycle decision, which governs whether an
+# already-paired CGM can reconnect at all. It has been wrong in both directions.
+scantest:
+	@mkdir -p tmp/uitest
+	cc -iquote src $(TESTWARN) test/scantest.c src/scanlogic.c -o tmp/uitest/scantest
+	@./tmp/uitest/scantest > tmp/uitest/scantest.log 2>&1 \
+	    && grep -q "ALL SCAN TESTS PASSED" tmp/uitest/scantest.log \
+	    && printf '\033[1;32mscantest\033[0m: scan lifecycle OK\n' \
+	    || { cat tmp/uitest/scantest.log; exit 1; }
+
+# Offline end-to-end protocol test: a simulated Stelo runs the real J-PAKE
+# server side and answers the driver's writes, and the final glucose is decoded
+# from REAL captured bytes. Covers subscribe sequencing, round
+# request/reassembly/chunking, the 02/03/04/05 auth exchange, shared-key
+# agreement + persistence, and EGV decode.
+#
+# This existed but was built by NO target, so nothing exercised dexdriver.c,
+# dexauth.c, dexdata.c, p256.c, aes.c or sha256.c -- the crypto and protocol
+# core had zero automated coverage, and the test had rotted (stale include, a
+# typedef the tree no longer uses, four transport hooks added since). Wiring it
+# in means a new hook breaks the build instead of silently going untested.
+DRVTEST_SRC := test/test_driver.c src/dexdriver.c src/dexauth.c src/dexdata.c \
+               src/p256.c src/sha256.c src/aes.c src/util.c
+
+drivertest:
+	@mkdir -p tmp/uitest
+	cc -DDEXDRIVER_TEST -iquote src -iquote test $(JVM_INC) $(TESTWARN) \
+	    $(DRVTEST_SRC) -o tmp/uitest/drivertest
+	./tmp/uitest/drivertest > tmp/uitest/drivertest.log 2>&1 \
+	    && grep -q "ALL DRIVER TESTS PASSED" tmp/uitest/drivertest.log \
+	    && printf '\033[1;32mdrivertest\033[0m: pairing + auth + EGV decode OK\n' \
+	    || { tail -20 tmp/uitest/drivertest.log; exit 1; }
+
+.PHONY: FORCE all release aab install run uninstall clean check crosscheck javacheck format format-fix tidy done uitest drivertest alarmtest storetest statstest metertest registrytest settingstest scantest

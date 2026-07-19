@@ -117,9 +117,28 @@ int close(int fd)
    return 0;
 }
 
+int rename(const char *from, const char *to)
+{
+   (void)from;
+   (void)to;
+   return 0;
+}
+
 int unlink(const char *p)
 {
    (void)p;
+   return 0;
+}
+
+int ftruncate(int fd, long len)
+{
+   (void)fd;
+   (void)len;
+   return 0;
+}
+
+int sched_yield(void)
+{
    return 0;
 }
 

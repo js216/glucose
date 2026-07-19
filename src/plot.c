@@ -14,13 +14,101 @@ static void put(uint32_t *fb, int stride, int fbw, int fbh, int x, int y,
       fb[(y * stride) + x] = c;
 }
 
+/* Plot rectangle a marker may paint into. A capped reading is centred on the
+ * boundary gridline, so half its marker would otherwise land outside the frame
+ * and paint over whatever is next to the plot. */
+static int clip_x0, clip_y0, clip_x1, clip_y1;
+
+static void putc_clipped(uint32_t *fb, int stride, int fbw, int fbh, int x,
+                         int y, uint32_t c)
+{
+   if (x < clip_x0 || x > clip_x1 || y < clip_y0 || y > clip_y1)
+      return;
+   put(fb, stride, fbw, fbh, x, y, c);
+}
+
 /* Filled square dot, half-width r, centred on (cx,cy). */
 static void dot(uint32_t *fb, int stride, int fbw, int fbh, int cx, int cy,
                 int r, uint32_t c)
 {
    for (int dy = -r; dy <= r; dy++)
       for (int dx = -r; dx <= r; dx++)
-         put(fb, stride, fbw, fbh, cx + dx, cy + dy, c);
+         putc_clipped(fb, stride, fbw, fbh, cx + dx, cy + dy, c);
+}
+
+/* One marker of the given shape, half-width r, centred on (cx,cy). Shapes are
+ * kept simple and open-centred (except the dot) so overlapping sensors stay
+ * readable where their traces cross. */
+static void mark(uint32_t *fb, int stride, int fbw, int fbh, int cx, int cy,
+                 int r, int shape, uint32_t c)
+{
+   /* Shape codes mirror sensors.h MARK_*: 0 dot, 1 cross, 2 square, 3 triangle,
+    * 5 square-filled, 6 triangle-filled, 7 circle, 8 circle-filled. (4 = HIDE
+    * never reaches here.) */
+   switch (shape) {
+   case 1: /* cross */
+      for (int d = -r; d <= r; d++) {
+         putc_clipped(fb, stride, fbw, fbh, cx + d, cy + d, c);
+         putc_clipped(fb, stride, fbw, fbh, cx + d, cy - d, c);
+      }
+      return;
+   case 2: /* open square */
+      for (int d = -r; d <= r; d++) {
+         putc_clipped(fb, stride, fbw, fbh, cx + d, cy - r, c);
+         putc_clipped(fb, stride, fbw, fbh, cx + d, cy + r, c);
+         putc_clipped(fb, stride, fbw, fbh, cx - r, cy + d, c);
+         putc_clipped(fb, stride, fbw, fbh, cx + r, cy + d, c);
+      }
+      return;
+   case 5: /* filled square */
+      for (int dy = -r; dy <= r; dy++)
+         for (int dx = -r; dx <= r; dx++)
+            putc_clipped(fb, stride, fbw, fbh, cx + dx, cy + dy, c);
+      return;
+   case 3: /* open triangle */
+      for (int dy = -r; dy <= r; dy++) {
+         int half = (dy + r) / 2;
+         putc_clipped(fb, stride, fbw, fbh, cx - half, cy + dy, c);
+         putc_clipped(fb, stride, fbw, fbh, cx + half, cy + dy, c);
+      }
+      for (int dx = -r; dx <= r; dx++)
+         putc_clipped(fb, stride, fbw, fbh, cx + dx, cy + r, c);
+      return;
+   case 6: /* filled triangle */
+      for (int dy = -r; dy <= r; dy++) {
+         int half = (dy + r) / 2;
+         for (int dx = -half; dx <= half; dx++)
+            putc_clipped(fb, stride, fbw, fbh, cx + dx, cy + dy, c);
+      }
+      return;
+   case 7:   /* open circle */
+   case 8: { /* filled circle */
+      int r2    = r * r;
+      int inner = (r - 1) * (r - 1);
+      for (int dy = -r; dy <= r; dy++)
+         for (int dx = -r; dx <= r; dx++) {
+            int d2 = (dx * dx) + (dy * dy);
+            if (d2 <= r2 && (shape == 8 || d2 > inner))
+               putc_clipped(fb, stride, fbw, fbh, cx + dx, cy + dy, c);
+         }
+      return;
+   }
+   default: /* dot (0) */
+      dot(fb, stride, fbw, fbh, cx, cy, r, c);
+      return;
+   }
+}
+
+/* Draw one marker glyph anywhere (menu previews), clipped only to the buffer.
+ * Standalone from plot_render, so it sets its own clip rectangle. */
+void plot_marker_glyph(uint32_t *fb, int stride, int fbw, int fbh, int cx,
+                       int cy, int r, int shape, uint32_t c)
+{
+   clip_x0 = 0;
+   clip_y0 = 0;
+   clip_x1 = fbw - 1;
+   clip_y1 = fbh - 1;
+   mark(fb, stride, fbw, fbh, cx, cy, r, shape, c);
 }
 
 /* Top of the vertical scale in mg/dL; runtime-adjustable (PLOT MAX setting). */
@@ -36,6 +124,11 @@ void plot_set_max(int mgdl)
  */
 static int glu_to_y(int glu, int y, int h)
 {
+   /* Out-of-range readings are capped, not dropped: a value above the scale
+    * lands exactly on the plot_max gridline (and below the scale, exactly on
+    * the bottom one), so an excursion is still visible and still sits on a row
+    * the axis labels explain. plot_hit and plot_point_xy share this mapping, so
+    * a capped point stays scrubbable where it is drawn. */
    if (glu < PLOT_GLU_MIN)
       glu = PLOT_GLU_MIN;
    if (glu > g_glu_max)
@@ -46,11 +139,22 @@ static int glu_to_y(int glu, int y, int h)
 }
 
 /* X pixel for a reading `dt` seconds before now (newest at the right edge). */
+/* Horizontal margin (px) reserved at each end so a marker centred on the newest
+ * or oldest datapoint is not half-clipped by the frame. Set from the marker
+ * radius in plot_render; plot_hit reuses the last value. */
+static int t_margin = 4;
+
 static int t_to_x(long dt, int x, int w, long span)
 {
    if (dt < 0)
       dt = 0;
-   return x + w - 2 - (int)((long)(w - 3) * dt / span);
+   /* Pad the RIGHT edge only (t_margin), so the newest point isn't half-clipped;
+    * the LEFT edge runs flush to the frame so an extra (older) datapoint can show
+    * there. Hence a single t_margin in usable, not two. */
+   int usable = w - 3 - t_margin;
+   if (usable < 1)
+      usable = 1;
+   return x + w - 2 - t_margin - (int)((long)usable * dt / span);
 }
 
 void plot_render(uint32_t *fb, int stride, int fbw, int fbh, int x, int y,
@@ -65,6 +169,12 @@ void plot_render(uint32_t *fb, int stride, int fbw, int fbh, int x, int y,
    long span            = (long)hours * 3600;
    if (radius < 1)
       radius = 1;
+   /* Reserve enough at each end for the LARGEST marker (radius scaled up to
+    * MARK_SIZE_MAX/2, +1 for styled points) so the newest datapoint is not half
+    * cut off at the right edge. */
+   t_margin = ((radius * 5) / 2) + 2;
+   if ((2 * t_margin) > (w - 4))
+      t_margin = (w - 4) / 2; /* never collapse the usable width */
    if (span <= 0 || w < 4 || h < 4)
       return;
 
@@ -77,12 +187,27 @@ void plot_render(uint32_t *fb, int stride, int fbw, int fbh, int x, int y,
    for (int j = y_hi; j <= y_lo; j++)
       for (int i = 1; i < w - 1; i++)
          put(fb, stride, fbw, fbh, x + i, j, band);
+   /* Thin light lines at the top (180) and bottom (70) edges of the range, so
+    * the band stays legible in bright sunlight where the faint fill washes
+    * out. */
+   const uint32_t edge = 0xFFAAAAAA;
+   for (int i = 1; i < w - 1; i++) {
+      put(fb, stride, fbw, fbh, x + i, y_hi, edge);
+      put(fb, stride, fbw, fbh, x + i, y_lo, edge);
+   }
 
    /* vertical gridlines + bottom x-ticks: hourly for hour-scale windows
     * (3 lines for 3H ... 24 for 24H), daily once the span exceeds a day
     * (3 lines for 3D, 7 for 7D) so multi-day plots aren't a picket fence */
    long gstep = (span <= 24L * 3600) ? 3600 : 24L * 3600;
-   for (long ts = gstep; ts <= span; ts += gstep) {
+   /* Anchor lines to exact clock boundaries -- the last full hour (or day)
+    * before now -- so every vertical line lands on a round time instead of an
+    * arbitrary offset back from now. (Whole-hour time zones; sub-hour zones
+    * shift slightly as this layer carries no tz.) */
+   long first = now % gstep;
+   if (first <= 0)
+      first = gstep; /* exactly on a boundary: skip the right edge */
+   for (long ts = first; ts <= span; ts += gstep) {
       int gx = t_to_x(ts, x, w, span);
       for (int j = y_top + 1; j < y50; j++)
          put(fb, stride, fbw, fbh, gx, j, vgrid);
@@ -100,6 +225,13 @@ void plot_render(uint32_t *fb, int stride, int fbw, int fbh, int x, int y,
       put(fb, stride, fbw, fbh, x + w - 1, j, frame);
    }
 
+   /* Markers may paint only inside the frame; a capped reading sits on the
+    * boundary gridline and would otherwise spill past it. */
+   clip_x0 = x + 1;
+   clip_y0 = y + 1;
+   clip_x1 = x + w - 2;
+   clip_y1 = y + h - 2;
+
    /* one dot per in-window reading; the highlighted one drawn last, on top */
    int hx = -1;
    int hy = -1;
@@ -109,6 +241,8 @@ void plot_render(uint32_t *fb, int stride, int fbw, int fbh, int x, int y,
          dt = 0;
       if (dt > span)
          continue;
+      if (pts[i].hidden) /* HIDE marker: this device is not drawn */
+         continue;
       int px = t_to_x(dt, x, w, span);
       int py = glu_to_y(pts[i].glu, y, h);
       if (i == hi_idx) {
@@ -116,7 +250,19 @@ void plot_render(uint32_t *fb, int stride, int fbw, int fbh, int x, int y,
          hy = py;
          continue;
       }
-      dot(fb, stride, fbw, fbh, px, py, radius, color(pts[i].glu));
+      /* An explicit colour means the point carries its own styling (a meter
+       * reading, or a second sensor); otherwise fall back to the value-based
+       * palette the caller supplied. Styled points are drawn a little larger
+       * so a sparse fingerstick is visible against a dense CGM trace. */
+      uint32_t c = pts[i].col ? pts[i].col : color(pts[i].glu);
+      int r      = pts[i].col ? radius + 1 : radius;
+      /* Per-device SIZE multiplies the span-scaled base radius (default size 2
+       * == the base), so markers stay proportional across 3H..7D spans. */
+      int sz = pts[i].size > 0 ? pts[i].size : 2;
+      r      = (r * sz) / 2;
+      if (r < 1)
+         r = 1;
+      mark(fb, stride, fbw, fbh, px, py, r, pts[i].marker, c);
    }
    if (hx >= 0) {
       /* white vertical marker; only the dot itself is highlighted in colour */
@@ -126,6 +272,11 @@ void plot_render(uint32_t *fb, int stride, int fbw, int fbh, int x, int y,
    }
 }
 
+/* Pixel centre of one point under plot_render's own mapping. The app resolves
+ * touches with plot_hit and never needs this, but it is the seam the offline
+ * harness uses to assert the out-of-range capping rule (a reading above the
+ * scale must land EXACTLY on the plot_max gridline) without decoding pixels.
+ * Keeping the assertion honest requires exposing the mapping, not a copy. */
 int plot_point_xy(int x, int y, int w, int h, struct plot_pt p, long now,
                   int hours, int *ox, int *oy)
 {
@@ -156,6 +307,8 @@ int plot_hit(int x, int y, int w, int h, const struct plot_pt *pts, int npts,
    int best   = -1;
    long bestd = 0;
    for (int i = 0; i < npts; i++) {
+      if (pts[i].hidden) /* a HIDDEN device is off the plot: not selectable */
+         continue;
       long dt = now - pts[i].t;
       if (dt < 0)
          dt = 0;

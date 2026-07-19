@@ -62,6 +62,15 @@ static const uint8_t font_larrow[7] = {0x00, 0x04, 0x08, 0x1F,
                                        0x08, 0x04, 0x00}; /* backspace */
 static const uint8_t font_uscore[7] = {0x00, 0x00, 0x00, 0x00,
                                        0x00, 0x00, 0x1F}; /* entry slot */
+/* '>' marks the PRIMARY sensor in the list. Without a glyph it drew as a blank
+ * cell, so the one thing that row exists to show -- which sensor owns the big
+ * number -- was invisible and a primary row looked identical to any other. */
+static const uint8_t font_rarrow[7] = {0x00, 0x08, 0x04, 0x1F,
+                                       0x04, 0x08, 0x00};
+/* ',' appears in the medical disclaimer; '?' in FORGET? and in an unknown
+ * calibration-permitted state. Both rendered blank. */
+static const uint8_t font_comma[7] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x08};
+static const uint8_t font_quest[7] = {0x0E, 0x11, 0x01, 0x02, 0x04, 0x00, 0x04};
 
 const uint8_t *glyph_for(char c)
 {
@@ -93,7 +102,13 @@ const uint8_t *glyph_for(char c)
       return font_larrow; /* backspace key label */
    if (c == '_')
       return font_uscore; /* keypad entry placeholder */
-   return 0;              /* space / unknown: blank cell */
+   if (c == '>')
+      return font_rarrow; /* primary-sensor marker */
+   if (c == ',')
+      return font_comma;
+   if (c == '?')
+      return font_quest;
+   return 0; /* space / unknown: blank cell */
 }
 
 int str_len(const char *s)

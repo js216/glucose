@@ -11,6 +11,7 @@
 
 #include <jni.h>
 #include <stddef.h>
+#include <stdint.h>
 
 /* The NDK entry point (defined in main.c). Declared here so it has a visible
  * prototype and is understood to be externally linked (the Android runtime
@@ -24,17 +25,52 @@ void stealo_status(const char *s);
 void stealo_glucose(int mg_dl, int trend, int age_s);
 void stealo_backfill(int mg_dl, int trend, int age_s);
 void stealo_rssi(int rssi);
-void stealo_devinfo(const char *uuid, const char *val);
+void stealo_meter_rssi(int rssi);
+/* Result of a calibration write the sensor answered: 0 accepted, >0 rejected.
+ * Clears or surfaces the durably-queued calibration. */
+void stealo_cal_result(int result);
+void stealo_devinfo(int link, const char *uuid, const char *val);
 
 /* BLE transport -- implemented in dexble.c, called from main.c. */
 void dexble_init(const char *data_dir);
 int dexble_register(JNIEnv *env, jclass ble, jobject ctx);
 void dexble_set_alarm(JNIEnv *env, jclass alarm_cls);
-void dexble_pair(JNIEnv *env, const char *mac, const char *code);
-void dexble_reconnect(JNIEnv *env); /* stall watchdog: force a fresh connect */
+/* Pair/connect a Dexcom sensor on `link`. */
+void dexble_pair(int link, const char *mac, const char *code);
+/* Evaluate + actuate the alarm. Any thread; must NOT hold driver_lock. */
+void stealo_alarm_check(void);
+/* Re-connect any CGM link that has gone quiet. Safe on any thread, and safe
+ * with no activity alive -- the service heartbeat drives it so a stranded link
+ * is repaired even after the activity is destroyed. */
+void stealo_link_watchdog(void);
+/* Time out a wedged meter sync. Safe on any thread and with no activity
+ * alive; the service heartbeat drives it so a sync interrupted by the
+ * activity's teardown cannot latch g_meter_busy forever. */
+void meter_sync_watchdog(void);
+/* Keep the sensor registry in step with the live session. Safe on any thread
+ * and with no activity alive; the service heartbeat drives it so a sensor that
+ * bonds in the background is still registered. */
+void stealo_reconcile_tick(void);
+JNIEnv *dexble_env(void); /* a JNIEnv valid on the CALLING thread */
+jobject dexble_ctx(void); /* app Context global ref; outlives the activity */
+/* Refresh the lock-screen notification. Safe on any thread and with no
+ * activity alive -- the service heartbeat drives it so the notification keeps
+ * tracking readings after the activity is destroyed. */
+void stealo_notify_refresh(void);
+void dexble_reconnect(int link); /* stall watchdog: force a fresh connect */
 void dexble_request_devinfo(void);
-void dexble_alarm(int kind, int sound,
-                  int vibrate); /* 0 low, 1 high, 2 stale */
-void dexble_alarm_silence(void);
+void dexble_request_devinfo_link(int link);
+/* Drop one link. The meter driver uses this the moment it has what it needs,
+ * so the meter can power itself down instead of being held awake. */
+void dexble_link_close(int link);
+/* Link-addressed GATT operations (the drv_* hooks wrap these for LINK_CGM). */
+void dexble_subscribe(int link, const char *uuid, int indicate);
+void dexble_write(int link, const char *uuid, const uint8_t *d, int n,
+                  int no_resp);
+/* Connect to a OneTouch meter on LINK_METER (independent of the CGM link). */
+void dexble_meter_connect(const char *mac);
+int dexble_alarm(int kind, int sound, int vibrate); /* 0 low, 1 high, 2 stale */
+void dexble_beep(void); /* one short NEW DATAPOINT beep */
+int dexble_alarm_silence(void);
 
 #endif

@@ -168,6 +168,7 @@ public final class StealoService extends Service {
          * stop cleanly so the app is simply gone until reopened, never a zombie. */
         if (i == null) { stopSelf(); return START_NOT_STICKY; }
         holdWakelock();          /* keep the CPU processing BLE while the screen is off */
+        startTicking();          /* alarms must not depend on a live activity */
         scheduleWake();          /* re-arm each time, including on each wake tick */
         return START_STICKY;     /* restart if the system kills us while running */
     }
@@ -179,6 +180,69 @@ public final class StealoService extends Service {
             Intent restart = new Intent(getApplicationContext(), StealoService.class);
             getApplicationContext().startForegroundService(restart);
         } catch (Throwable t) { Log.i("stealo", "onTaskRemoved: " + t); }
+    }
+
+    /* Service-owned heartbeat.
+     *
+     * The alarm used to be evaluated only on the activity's 1 Hz looper timer,
+     * which onDestroy tears down -- so after a back-press or a task swipe, with
+     * this service still holding the BLE connection alive for days, a hypo was
+     * decoded and logged but never sounded, and an alarm already ringing could
+     * never be silenced. The heartbeat has to belong to whatever outlives the
+     * activity, which is this service.
+     *
+     * 20 s is well inside the shortest DISCONNECT threshold (15 min) and costs
+     * nothing: it touches no radio, only re-evaluates state already in memory. */
+    private static final int TICK_MS = 20000;
+    /* volatile: written on the main thread (onDestroy), read on the tick
+     * thread. Without it the tick thread may never observe the null. */
+    private volatile android.os.Handler tick;
+    private final Runnable ticker = new Runnable() {
+        @Override public void run() {
+            /* EVERYTHING inside the try. The reschedule used to sit outside it
+             * and read `tick` twice: onDestroy can null the field between the
+             * check and the postDelayed, and that NPE escapes run() inside a
+             * Looper dispatch -> uncaught handler -> the PROCESS IS KILLED.
+             * That process holds the CGM connection and the alarm, so a service
+             * teardown could take the alarm down with it. */
+            try {
+                Ble.onTick();
+                android.os.Handler h = tick;   /* read once */
+                if (h != null) h.postDelayed(this, TICK_MS);
+            } catch (Throwable t) { Log.i("stealo", "tick: " + t); }
+        }
+    };
+
+    private android.os.HandlerThread tickThread;
+
+    private void startTicking() {
+        if (tick != null) return;
+        /* A DEDICATED thread, not the main looper.
+         *
+         * The tick calls into native, which can raise an alarm -- and that path
+         * holds a no-timeout spin lock across MediaPlayer setDataSource/prepare/
+         * start, hundreds of milliseconds of media-server IPC. On the main looper
+         * that stalls every other main-thread callback, and if a BLE thread is
+         * already inside that critical section the main looper SPINS waiting for
+         * it. An ANR here would kill the process holding the CGM connection,
+         * i.e. the alarm itself. */
+        tickThread = new android.os.HandlerThread("stealo-tick");
+        tickThread.start();
+        tick = new android.os.Handler(tickThread.getLooper());
+        tick.postDelayed(ticker, TICK_MS);
+    }
+
+    @Override public void onDestroy() {
+        if (tick != null) { tick.removeCallbacks(ticker); tick = null; }
+        if (tickThread != null) { tickThread.quitSafely(); tickThread = null; }
+        /* Release the partial wakelock. It is acquired in holdWakelock() and
+         * nothing released it, so after a stopSelf() or a system-initiated
+         * destroy the process held the CPU awake indefinitely while doing no
+         * BLE work at all -- a battery drain with no upside. */
+        try {
+            if (wakelock != null && wakelock.isHeld()) wakelock.release();
+        } catch (Throwable t) { Log.i("stealo", "wakelock release: " + t); }
+        super.onDestroy();
     }
 
     @Override public IBinder onBind(Intent i) { return null; }

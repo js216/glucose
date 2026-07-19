@@ -13,6 +13,8 @@ extern char g_model[24], g_fw[24],
 extern int g_alarm_low, g_alarm_high; /* thresholds, mg/dL */
 extern int g_sound_on, g_vib_on;      /* alarm sound / vibration */
 extern int g_orient;        /* 0 portrait 1 landscape 2 gravity 3 system */
+extern int g_screen_on;     /* 1 keep screen on while open, 0 follow the OS */
+extern int g_newdata_beep;  /* 1 = short beep on each new primary-CGM datapoint */
 extern int g_units;         /* 0 mg/dL, 1 mmol/L */
 extern int g_disc;          /* stale-data alarm: index into disc_min */
 extern int g_plot_max;      /* plot vertical-scale top, mg/dL */
@@ -24,7 +26,10 @@ void info_save(void); /* device-info strings "model\nfw\nmfr\n" */
 void info_load(void);
 void alarm_save(void); /* "low high\n" */
 void alarm_load(void);
-void settings_save(void); /* "sound vib orient units disc plot_max\n" */
+/* "sound vib orient units disc plot_max screen_on\n" -- fields are read
+ * positionally and the parse stops at the first missing one, so appending a
+ * field keeps older config files loadable (the new field keeps its default). */
+void settings_save(void);
 void settings_load(void); /* also applies plot_set_max() */
 void code_save(void);     /* pairing code digits */
 void code_load(void);

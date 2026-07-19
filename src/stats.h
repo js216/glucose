@@ -13,4 +13,14 @@ int stat_window(int days, int *tir, int *avg);
 /* seed the buckets from the tail of the readings CSV at `readings_path`. */
 void stat_load(const char *readings_path);
 
+/* Ring capacity in hours. Exposed so the tests can sit exactly on the boundary
+ * where an over-old reading would alias onto a live bucket. */
+#define STAT_HOURS 2200
+
+/* Injectable-clock forms. The public calls above are these with
+ * realtime_s(); tests drive these directly so the hour boundaries -- where the
+ * aliasing bug lived -- are reachable deterministically. */
+void stat_add_at(long t, int glu, long now);
+int stat_window_at(int days, int *tir, int *avg, long now);
+
 #endif

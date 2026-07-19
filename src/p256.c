@@ -6,6 +6,7 @@
 #include "p256.h"
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h> /* memset: zero affine outputs on the infinity path */
 
 /* ---- 256-bit little-endian limb arithmetic ---- */
 static int u256_iszero(const struct u256 *a)
@@ -53,9 +54,9 @@ static void u256_from_be(struct u256 *r, const uint8_t b[32])
    for (int i = 0; i < 4; i++) {
       const uint8_t *p = b + ((size_t)(3 - i) * 8);
       r->v[i]          = ((uint64_t)p[0] << 56U) | ((uint64_t)p[1] << 48U) |
-                         ((uint64_t)p[2] << 40U) | ((uint64_t)p[3] << 32U) |
-                         ((uint64_t)p[4] << 24U) | ((uint64_t)p[5] << 16U) |
-                         ((uint64_t)p[6] << 8U) | (uint64_t)p[7];
+                ((uint64_t)p[2] << 40U) | ((uint64_t)p[3] << 32U) |
+                ((uint64_t)p[4] << 24U) | ((uint64_t)p[5] << 16U) |
+                ((uint64_t)p[6] << 8U) | (uint64_t)p[7];
    }
 }
 
@@ -406,8 +407,20 @@ void p256_pneg(struct jpoint *r, const struct jpoint *P_)
 
 int p256_to_xy(const struct jpoint *P_, uint8_t x[32], uint8_t y[32])
 {
-   if (u256_iszero(&P_->Z))
+   if (u256_iszero(&P_->Z)) {
+      /* ZERO the outputs on failure. The point at infinity has no affine
+       * coordinates, and every caller passes an uninitialised stack buffer --
+       * so leaving them untouched published whatever the stack last held.
+       * dexauth's cert_byteify ignored this return entirely and transmitted
+       * the result, and a peer CAN force the failure: round 3 multiplies by
+       * (pubA + peer_pub1 + peer_pub2), and a peer that picks pub2 =
+       * -(pubA + pub1) makes that the point at infinity. Zeroing makes the
+       * failure deterministic; callers that must not proceed check the
+       * return. */
+      memset(x, 0, 32);
+      memset(y, 0, 32);
       return 0;
+   }
    struct u256 zi;
    struct u256 zi2;
    struct u256 zi3;

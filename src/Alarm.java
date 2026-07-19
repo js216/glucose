@@ -33,6 +33,36 @@ public final class Alarm {
     private static final String CH = "stealo-alarm";
     private static final int NID = 2;              /* distinct from the service's id 1 */
     private static MediaPlayer player;
+    /* trigger() runs on a BLE binder thread, silence() on the main looper.
+     * Unsynchronized, silence() could read `player` as null (the binder thread
+     * had not assigned it yet), do nothing, and return -- and the binder thread
+     * would then start a LOOPING alarm-usage MediaPlayer that nothing in the
+     * app could ever stop, because the C side already considers the alarm
+     * silenced and issues no further silence(). The mirror ordering released
+     * the player between prepare() and start(), throwing IllegalStateException
+     * into trigger()'s catch-all: a silently missing hypo alarm. Both are
+     * unacceptable for an alarm, so trigger() and silence() are both
+     * synchronized on the Alarm class monitor. They never call back into
+     * native code, so this monitor is a leaf and cannot deadlock against the
+     * C-side alarm_lock that surrounds these calls. */
+
+    /* A single short beep for the NEW DATAPOINT alert -- distinct from the
+     * looping glucose alarm. A ToneGenerator is kept alive and reused so each
+     * datapoint just fires a brief tone; nothing to silence. Called on a BLE
+     * binder thread, so it must not block. */
+    private static android.media.ToneGenerator toneGen;
+    public static synchronized void beep(Context ctx) {
+        try {
+            /* Media stream at full tone volume so it is actually audible; a
+             * fresh generator each time avoids a stale one going silent. */
+            if (toneGen != null) { try { toneGen.release(); } catch (Throwable t) {} }
+            toneGen = new android.media.ToneGenerator(
+                android.media.AudioManager.STREAM_MUSIC, 100);
+            boolean ok = toneGen.startTone(
+                android.media.ToneGenerator.TONE_PROP_BEEP, 200);
+            Log.i("stealo", "beep startTone=" + ok);
+        } catch (Throwable t) { Log.i("stealo", "beep: " + t); }
+    }
 
     private static void ensureChannel(NotificationManager nm) {
         if (nm.getNotificationChannel(CH) != null) return;
@@ -44,9 +74,68 @@ public final class Alarm {
     }
 
     /* kind: 0 = glucose low, 1 = glucose high, 2 = stale/disconnected */
-    public static void trigger(Context ctx, int kind, boolean sound, boolean vibrate) {
+    /* THE AUDIBLE PARTS GO FIRST, AND EACH STAGE HAS ITS OWN CATCH.
+     *
+     * This whole method used to be one try block with the notification built
+     * first. Anything that threw before the MediaPlayer block -- and the
+     * notification path is by far the most throw-prone thing here, touching
+     * NotificationManager, PendingIntent and a channel the user can alter --
+     * jumped straight to the catch, so the sound and the vibration never ran.
+     * The C side has already committed g_alarm_want by then, so alarm_apply
+     * considers the alarm RAISED and never retries: a hypo that produces one
+     * log line and no sound. Three independent stages means a failure in one
+     * cannot silence the others, and the ones that actually wake the user are
+     * attempted before the one that merely informs them. */
+    public static synchronized void trigger(Context ctx, int kind, boolean sound, boolean vibrate) {
+        Context app;
+        try { app = ctx.getApplicationContext(); }
+        catch (Throwable t) { Log.i("stealo", "alarm trigger (context): " + t); return; }
+
+        /* 1. Sound. */
         try {
-            Context app = ctx.getApplicationContext();
+            stopSound();
+            if (sound) {
+                Uri uri = RingtoneManager.getActualDefaultRingtoneUri(app, RingtoneManager.TYPE_ALARM);
+                if (uri == null) uri = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_ALARM);
+                if (uri != null) {
+                    player = new MediaPlayer();
+                    player.setAudioAttributes(new AudioAttributes.Builder()
+                        .setUsage(AudioAttributes.USAGE_ALARM)
+                        .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION).build());
+                    player.setDataSource(app, uri);
+                    player.setLooping(true);
+                    player.prepare();
+                    player.start();
+                }
+            }
+        } catch (Throwable t) {
+            /* Drop a half-built player: prepare() or start() throwing leaves it
+             * allocated but not looping, and silence() would then release an
+             * object that is not making noise while the real problem persists. */
+            stopSound();
+            Log.i("stealo", "alarm trigger (sound): " + t);
+        }
+
+        /* 2. Vibration -- the fallback when the phone is muted.
+         *
+         * cancel() FIRST and unconditionally, mirroring stage 1's stopSound().
+         * The waveform repeats until cancelled, so without this a re-trigger
+         * with vibrate=false left the PREVIOUS alarm's buzzing running: turn
+         * VIBRATION off while a LOW is active, then let it cross to HIGH, and
+         * the low's waveform kept going with nothing in trigger() to stop it.
+         * Stage 1 already had this shape; stage 2 was the asymmetry the staged
+         * restructure was supposed to remove. */
+        try {
+            Vibrator v = app.getSystemService(Vibrator.class);
+            if (v != null) {
+                v.cancel();
+                if (vibrate && v.hasVibrator())   /* 600ms on / 400ms off, repeating */
+                    v.vibrate(VibrationEffect.createWaveform(new long[]{0, 600, 400}, 0));
+            }
+        } catch (Throwable t) { Log.i("stealo", "alarm trigger (vibrate): " + t); }
+
+        /* 3. Notification -- informational; must never suppress 1 or 2. */
+        try {
             NotificationManager nm = app.getSystemService(NotificationManager.class);
             ensureChannel(nm);
 
@@ -67,40 +156,49 @@ public final class Alarm {
                 .setOngoing(true)
                 .build();
             nm.notify(NID, n);
-
-            Vibrator v = app.getSystemService(Vibrator.class);
-            if (vibrate && v != null && v.hasVibrator())   /* 600ms on / 400ms off, repeating */
-                v.vibrate(VibrationEffect.createWaveform(new long[]{0, 600, 400}, 0));
-
-            stopSound();
-            Uri uri = RingtoneManager.getActualDefaultRingtoneUri(app, RingtoneManager.TYPE_ALARM);
-            if (uri == null) uri = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_ALARM);
-            if (sound && uri != null) {
-                player = new MediaPlayer();
-                player.setAudioAttributes(new AudioAttributes.Builder()
-                    .setUsage(AudioAttributes.USAGE_ALARM)
-                    .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION).build());
-                player.setDataSource(app, uri);
-                player.setLooping(true);
-                player.prepare();
-                player.start();
-            }
-        } catch (Throwable t) { Log.i("stealo", "alarm trigger: " + t); }
+        } catch (Throwable t) { Log.i("stealo", "alarm trigger (notify): " + t); }
     }
 
-    public static void silence(Context ctx) {
+    /* Staged for the same reason as trigger(), and it matters MORE here.
+     *
+     * These three used to share one try block with the vibrator first, so a
+     * throw from v.cancel() skipped stopSound() and left a LOOPING
+     * USAGE_ALARM MediaPlayer running. The C side clears g_alarm_sounding
+     * either way, so nothing would ever call silence() again: a tone that
+     * plays until the process dies, which is precisely the un-silenceable
+     * alarm the locking around these calls exists to prevent. Stop the sound
+     * FIRST and unconditionally. */
+    public static synchronized void silence(Context ctx) {
+        try { stopSound(); }
+        catch (Throwable t) { Log.i("stealo", "alarm silence (sound): " + t); }
+
+        Context app;
+        try { app = ctx.getApplicationContext(); }
+        catch (Throwable t) { Log.i("stealo", "alarm silence (context): " + t); return; }
+
         try {
-            Context app = ctx.getApplicationContext();
             Vibrator v = app.getSystemService(Vibrator.class);
             if (v != null) v.cancel();
-            stopSound();
+        } catch (Throwable t) { Log.i("stealo", "alarm silence (vibrate): " + t); }
+
+        try {
             NotificationManager nm = app.getSystemService(NotificationManager.class);
             if (nm != null) nm.cancel(NID);
-        } catch (Throwable t) { Log.i("stealo", "alarm silence: " + t); }
+        } catch (Throwable t) { Log.i("stealo", "alarm silence (notify): " + t); }
     }
 
+    /* release() gets its OWN try, and the reference is dropped last.
+     *
+     * With one combined try, a throw from stop() skipped release() and then
+     * nulled the only reference -- leaving a looping USAGE_ALARM player that
+     * nothing in the process could ever reach again. That is precisely the
+     * un-silenceable alarm the rest of this file is built to prevent, and it
+     * was the one place here that was not stage-isolated. */
     private static void stopSound() {
-        try { if (player != null) { player.stop(); player.release(); player = null; } }
-        catch (Throwable t) { player = null; }
+        MediaPlayer p = player;
+        if (p == null) return;
+        try { p.stop(); } catch (Throwable t) { Log.i("stealo", "stop: " + t); }
+        try { p.release(); } catch (Throwable t) { Log.i("stealo", "release: " + t); }
+        player = null;
     }
 }

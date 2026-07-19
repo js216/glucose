@@ -6,16 +6,26 @@
  *
  * The module is deliberately self-contained: plot_render() only writes RGBA
  * pixels into a caller-supplied framebuffer rectangle and knows nothing about
- * the rest of the app -- no globals, no fonts, no Android types. The caller
+ * the rest of the app -- no fonts, no Android types, and no state beyond the
+ * clip rectangle plot_render sets for its own markers. The caller
  * owns layout, the colour palette (passed as a function), and interaction. */
 #ifndef PLOT_H
 #define PLOT_H
 #include <stdint.h>
 
-/* One reading: epoch-second timestamp and glucose in mg/dL. */
+/* One reading: epoch-second timestamp and glucose in mg/dL, plus how to draw
+ * it. `marker` is a shape index (0 dot, 1 cross, 2 open square, 3 triangle) and
+ * `col` an ARGB override -- 0 means "ask the caller's color() callback", which
+ * is what continuous readings use. Sparse meter readings set both so they stay
+ * visually distinct from the CGM trace. This module stays dependency-free, so
+ * the shape indices are plain ints, not an enum borrowed from elsewhere. */
 struct plot_pt {
    long t;
    int glu;
+   int marker;
+   int hidden; /* 1 = do not draw (HIDE marker) */
+   int size;   /* per-device marker size 1..N; 0 = default */
+   uint32_t col;
 };
 
 /* Vertical scale runs PLOT_GLU_MIN..(runtime max, default PLOT_GLU_MAX) mg/dL.
@@ -45,8 +55,14 @@ void plot_render(uint32_t *fb, int stride, int fbw, int fbh, int x, int y,
 int plot_hit(int x, int y, int w, int h, const struct plot_pt *pts, int npts,
              long now, int hours, int tx, int ty);
 
+/* Draw a single marker glyph at (cx,cy), half-width r, for menu previews. Shape
+ * codes match sensors.h MARK_* (HIDE is not a drawable shape). */
+void plot_marker_glyph(uint32_t *fb, int stride, int fbw, int fbh, int cx,
+                       int cy, int r, int shape, uint32_t c);
+
 /* Pixel centre of point `p` under the same mapping as plot_render. Returns 1
- * and fills *ox,*oy if p is in-window; returns 0 otherwise. */
+ * and fills *ox,*oy if p is in-window; returns 0 otherwise. Used by the
+ * offline harness to assert the out-of-range capping rule. */
 int plot_point_xy(int x, int y, int w, int h, struct plot_pt p, long now,
                   int hours, int *ox, int *oy);
 

@@ -10,6 +10,16 @@
 #define DEXDRIVER_H
 #include <stdint.h>
 
+/* Concurrent GATT links. Each sensor gets its own link id, its own operation
+ * queue in Ble.java, and its own driver context -- so a slow or stalled sensor
+ * cannot hold up another one's advertising window, and two sensors sharing a
+ * GATT layout (Stelo and G7 do) never trample each other's state. Defined here
+ * rather than in stealo.h so the protocol layer stays free of JNI. */
+#define LINK_CGM   0 /* first Dexcom sensor */
+#define LINK_METER 1 /* OneTouch meter */
+#define LINK_CGM2  2 /* a second Dexcom sensor, streaming concurrently */
+#define LINK_MAX   5
+
 /* Dexcom GATT characteristic UUIDs. */
 #define U_CTRL  "f8083534-849e-531c-c594-30f1f86a4ea5"
 #define U_AUTH  "f8083535-849e-531c-c594-30f1f86a4ea5"
@@ -22,6 +32,9 @@ void drv_subscribe(const char *uuid, int indicate);
 void drv_write(const char *uuid, const uint8_t *data, int n, int no_resp);
 void drv_status(const char *s);
 void drv_glucose(int mg_dl, int trend, int age_s); /* current reading */
+/* Outcome of a calibration write we sent: 0 accepted, >0 rejected by the
+ * sensor. Lets the shell clear or surface its durably-queued calibration. */
+void drv_cal_result(int result);
 void drv_backfill(int mg_dl, int trend,
                   int age_s);      /* recovered older reading */
 int drv_key_load(uint8_t key[16]); /* returns 1 if a key was loaded */
@@ -33,6 +46,30 @@ void drv_mac_save(const char *mac); /* remember the sensor we bonded to */
 void drv_mac_clear(void);           /* forget it (re-pair) */
 
 /* ---- driver API (called by the transport layer) ---- */
+/* Point the driver at one link's state. The transport calls this before
+ * dispatching any callback or action, exactly as it already scopes its JNIEnv,
+ * so the rest of the API needs no link parameter. */
+void driver_select(int link);
+/* Serialise ALL driver state.
+ *
+ * GATT callbacks run inline on binder threads (connectGatt is called with no
+ * Handler), so several links dispatch genuinely concurrently, while the main
+ * thread also reads sessions at 1 Hz. The driver's per-link context is chosen
+ * by an ambient selector, so selection and the work that follows it must be
+ * one atomic step -- otherwise a context swap can land between a bounds check
+ * and its memcpy, or between deriving a key and choosing the file to save it
+ * in. The lock is recursive because the transport can complete a write
+ * synchronously and re-enter the driver from inside a driver call.
+ *
+ * This costs almost nothing in radio terms: the real per-link concurrency
+ * lives in Ble.java's per-link operation queues, and the sections guarded here
+ * are short and CPU-only. */
+void driver_lock(void);
+void driver_unlock(void);
+/* The link currently selected -- the transport uses it to address its GATT
+ * operations and per-sensor key storage. */
+int driver_link(void);
+
 void driver_init(void); /* dexauth_init + load saved key */
 void driver_start(const char *mac,
                   const char *code); /* set target + code, connect */
@@ -46,6 +83,38 @@ void driver_on_written(const char *uuid, int status);
 void driver_on_notify(const char *uuid, const uint8_t *buf, int n);
 void driver_request_backfill(
     long span_seconds); /* recover a gap ending at now */
+
+/* ---- calibration (opcodes 0x32 / 0x34) ----
+ *
+ * NEVER call driver_calibrate() automatically. Calibration is the only command
+ * in this app that changes how a sensor reports, it cannot be undone for the
+ * running session, and on a G7 it perturbs a device somebody may be relying on
+ * medically. Both entry points are strictly user-initiated.
+ *
+ * Framing note: the G7/Stelo generation takes a 7-byte 0x34 with NO trailing
+ * CRC and answers by reusing opcode 0x34 -- unlike the G5/G6 9-byte CRC form
+ * that xDrip and CGMBLEKit send. That difference is why the one public report
+ * of "Stelo ignores calibration" is inconclusive. */
+
+/* Ask the sensor what it permits. Read-only: mutates no sensor state. */
+void driver_cal_bounds(void);
+/* Submit a calibration in mg/dL. User-initiated only. Returns 1 if the write
+ * was issued, 0 if refused (not streaming / not permitted / out of range) -- the
+ * shell keeps the value queued and retries on a 0 rather than dropping it. */
+int driver_calibrate(int mg_dl);
+
+/* Last known answer to 0x32, plus the last 0x34 result. */
+struct dex_cal {
+   long asked;    /* realtime_s() when bounds were last requested */
+   int have;      /* a 0x32 reply has been parsed */
+   int permitted; /* byte[14]: firmware allows calibration */
+   int status;    /* byte[13]: 1 = factory, 2 = in progress, ... */
+   int last_bg;   /* byte[7..8]: last accepted calibration value */
+   long last_cal; /* byte[9..12]: sensor-clock time of that calibration */
+   int result;    /* last 0x34 status byte; -1 = none yet */
+};
+
+void driver_get_cal(struct dex_cal *out);
 
 /* Snapshot of what we know about the connected sensor and session. */
 struct dex_session {

@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0
-// dexdriver.c --- Dexcom pairing/reconnect protocol state machine
+// dexdriver.c --- Dexcom ctx->pairing/reconnect protocol state machine
 // Copyright 2026 Jakob Kastelic
 
-/* stealo protocol driver -- transport-agnostic Dexcom pairing/reconnect state
- * machine. See dexdriver.h. Event-driven: each transport callback advances the
- * state and issues the next operation via the drv_* hooks. Heavily logged.
+/* stealo protocol driver -- transport-agnostic Dexcom ctx->pairing/reconnect
+ * state machine. See dexdriver.h. Event-driven: each transport callback
+ * advances the state and issues the next operation via the drv_* hooks. Heavily
+ * logged.
  *
  * Flow (validated against a real Stelo capture):
  *   connect -> subscribe auth+round -> [fresh: J-PAKE rounds] -> 02/03/04/05
@@ -18,6 +19,7 @@
 #include "dexcerts.h"
 #include "dexdata.h"
 #include "dexlibc.h"
+#include "util.h" /* realtime_s */
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -26,9 +28,125 @@
 int __android_log_print(int prio, const char *tag, const char *fmt, ...);
 #define LOGI(...) __android_log_print(4, "stealo", __VA_ARGS__)
 
+/* Per-sensor driver state.
+ *
+ * Everything the pairing/auth/stream state machine touches lives here rather
+ * than in file statics, so several sensors can be driven at once -- a Stelo and
+ * a G7 share a GATT layout and would otherwise trample each other's phase,
+ * keys and session. One context per transport link; `D` points at whichever
+ * link the current callback belongs to, and every public entry point selects
+ * it before doing anything else. */
+struct dex_ctx {
+   int phase;
+   char g_mac[24];
+   uint8_t g_code[8];
+   int g_codelen;
+   int streamed;
+   int mac_saved; /* persisted this sensor's MAC this run (once) */
+   struct dex_pairing *pairing;
+   uint8_t shared_key[16];
+   int have_key;
+   uint8_t token[8];
+   int round_idx;
+   uint8_t rxbuf[160];
+   int rxlen;
+   int round_done; /* this round's buffer already handled (see on_notify) */
+   int tx_left, sub_idx;
+   int did_rounds;
+   /* A tokenHash on THIS connection was verified against our shared key.
+    *
+    * Rejecting a WRONG AuthChallenge is only half the check -- nothing
+    * required a correct one to have arrived at all. The 0x03 and 0x05 handlers
+    * are independent arms, so a peer could skip 0x03 entirely, send the three
+    * bytes 05 01 01, and land in P_STREAM with its frames accepted as real
+    * glucose. There is no link-layer fallback: the app never calls createBond,
+    * so this tokenHash is the ONLY thing authenticating the peer. */
+   int chal_ok;
+   uint32_t last_clock; /* sensor session-time from the latest 4e */
+   uint16_t last_age;   /* age of that current reading, seconds */
+   int last_glucose, last_trend, last_predicted, last_seq;
+   int g_bonded; /* last AuthStatus was the fast (auth==1) path */
+   int cert_idx, cert_size, cert_rx;
+   int cert_sent; /* our cert chunks sent this exchange */
+   /* Our signature for this key challenge has been sent.
+    *
+    * P_ROUNDS has round_done and P_CERT has cert_sent for exactly this;
+    * P_KEYCHAL had no equivalent, so a repeated 0c frame re-signed and called
+    * send_chunks again, resetting tx_left to 4 with 4 writes still in flight --
+    * the acks then stop matching and 0d goes out over a partially delivered
+    * signature. It also made the embedded collector key an unbounded
+    * chosen-message signing oracle: one signature per connection is the
+    * protocol; unlimited is not. */
+   int keychal_signed;
+   /* A calibration we actually sent is awaiting its 0x34 reply.
+    *
+    * The reply reuses the request opcode, and the handler re-reads the bounds
+    * (a 0x32 write) so the UI reflects the new state. Without this flag any
+    * 0x34 from the peer triggered that write, and firmware echoing it -- or a
+    * post-auth peer choosing to -- sustained a 0x32/0x34 ping-pong at
+    * connection-interval rate, draining both batteries and flooding the log
+    * for as long as the link stayed up. */
+   int cal_pending;
+   int fails;     /* consecutive connects that never streamed */
+   int authfails; /* subset: failures after we reached auth/cert */
+   struct dex_cal cal;
+};
+
+static struct dex_ctx g_dctx[LINK_MAX];
+static struct dex_ctx *ctx = &g_dctx[LINK_CGM];
+
+static int g_cur_link = LINK_CGM;
+
+/* Recursive spin lock guarding every access to `ctx` and the contexts it
+ * points at. Recursive because drv_write() can complete synchronously and
+ * re-enter driver_on_written() from inside a driver call. */
+static volatile int lock_owner; /* gettid() of the holder, 0 when free */
+static int lock_depth;
+
+void driver_lock(void)
+{
+   int me = gettid();
+   if (__atomic_load_n(&lock_owner, __ATOMIC_SEQ_CST) == me) {
+      lock_depth++;
+      return;
+   }
+   /* Yield while spinning. Most guarded sections are short, but a few reach
+    * blocking JNI (drv_connect -> connectGatt) or file I/O, and a binder thread
+    * busy-waiting through one of those burns a full core and can starve the
+    * (small) binder pool. */
+   while (!__sync_bool_compare_and_swap(&lock_owner, 0, me))
+      sched_yield();
+   lock_depth = 1;
+}
+
+void driver_unlock(void)
+{
+   if (--lock_depth > 0)
+      return;
+   __atomic_store_n(&lock_owner, 0, __ATOMIC_SEQ_CST);
+}
+
+void driver_select(int link)
+{
+   if (link < 0 || link >= LINK_MAX)
+      link = LINK_CGM;
+   g_cur_link = link;
+   ctx        = &g_dctx[link];
+}
+
+int driver_link(void)
+{
+   return g_cur_link;
+}
+
 static void loghex(const char *tag, const uint8_t *d, int n)
 {
+   /* Initialised: with n == 0 the loop below never runs, and %s would then
+    * print an unterminated stack buffer. A zero-length notification is
+    * reachable from any peer on the link (Ble substitutes an empty array for a
+    * null value) and this logs before any length check. */
    char b[(3 * 40) + 8];
+   b[0]    = 0;
    int l   = 0;
    int cap = n > 40 ? 40 : n;
    for (int i = 0; i < cap; i++)
@@ -55,57 +173,33 @@ static const char *phase_name(int p)
    return (p >= 0 && p <= 8) ? n[p] : "?";
 }
 
-static int phase;
-static char g_mac[24];
-static uint8_t g_code[8];
-static int g_codelen;
-static int streamed;
-static int mac_saved; /* persisted this sensor's MAC this run (once) */
-static struct dex_pairing *pairing;
-
 /* Once we actually stream from the connected sensor, remember its MAC so future
  * launches reconnect only to it. Runs once per process (cheap file write). */
 static void remember_sensor(void)
 {
-   if (!mac_saved && g_mac[0]) {
-      drv_mac_save(g_mac);
-      mac_saved = 1;
+   if (!ctx->mac_saved && ctx->g_mac[0]) {
+      drv_mac_save(ctx->g_mac);
+      ctx->mac_saved = 1;
    }
 }
-
-static uint8_t shared_key[16];
-static int have_key;
-static uint8_t token[8];
-static int round_idx;
-static uint8_t rxbuf[160];
-static int rxlen;
-static int tx_left, sub_idx;
-static int did_rounds;
-static uint32_t last_clock; /* sensor session-time from the latest 4e */
-static uint16_t last_age;   /* age of that current reading, seconds */
-static int last_glucose, last_trend, last_predicted, last_seq;
-static int g_bonded; /* last AuthStatus was the fast (auth==1) path */
 
 void driver_get_session(struct dex_session *out)
 {
    memset(out, 0, sizeof *out);
    int i = 0;
-   for (; g_mac[i] && i < 23; i++)
-      out->mac[i] = g_mac[i];
+   for (; ctx->g_mac[i] && i < 23; i++)
+      out->mac[i] = ctx->g_mac[i];
    out->mac[i]          = 0;
-   out->bonded          = g_bonded;
-   out->paired          = have_key;
-   out->have_reading    = (last_clock != 0);
-   out->session_seconds = last_clock;
-   out->glucose         = last_glucose;
-   out->trend           = last_trend;
-   out->age             = last_age;
-   out->predicted       = last_predicted;
-   out->sequence        = last_seq;
+   out->bonded          = ctx->g_bonded;
+   out->paired          = ctx->have_key;
+   out->have_reading    = (ctx->last_clock != 0);
+   out->session_seconds = ctx->last_clock;
+   out->glucose         = ctx->last_glucose;
+   out->trend           = ctx->last_trend;
+   out->age             = ctx->last_age;
+   out->predicted       = ctx->last_predicted;
+   out->sequence        = ctx->last_seq;
 }
-
-static int cert_idx, cert_size, cert_rx; /* certificate exchange */
-static int cert_sent; /* our cert chunks sent this exchange */
 
 /* Send our certificate once the sensor's is fully received. Called from BOTH
  * the chunk (U_ROUND) and size-announce (0x0b) paths, since the two can arrive
@@ -114,12 +208,13 @@ static void send_chunks(const uint8_t *buf, int len);
 
 static void cert_maybe_complete(void)
 {
-   if (cert_sent || cert_size <= 0 || cert_rx < cert_size)
+   if (ctx->cert_sent || ctx->cert_size <= 0 || ctx->cert_rx < ctx->cert_size)
       return;
-   cert_sent = 1;
-   LOGI("   sensor cert %d received (%d); sending ours", cert_idx, cert_rx);
-   send_chunks(cert_idx == 0 ? dex_cert0 : dex_cert1,
-               cert_idx == 0 ? DEX_CERT0_LEN : DEX_CERT1_LEN);
+   ctx->cert_sent = 1;
+   LOGI("   sensor cert %d received (%d); sending ours", ctx->cert_idx,
+        ctx->cert_rx);
+   send_chunks(ctx->cert_idx == 0 ? dex_cert0 : dex_cert1,
+               ctx->cert_idx == 0 ? DEX_CERT0_LEN : DEX_CERT1_LEN);
 }
 
 static const struct {
@@ -147,45 +242,78 @@ static uint32_t le32(const uint8_t *p)
           (uint32_t)p[3] << 24U;
 }
 
-/* issue a buffer to the round-transport char in 20-byte chunks; tx_left counts
- * acks */
+/* issue a buffer to the round-transport char in 20-byte chunks; ctx->tx_left
+ * counts acks */
 static void send_chunks(const uint8_t *buf, int len)
 {
-   tx_left = (len + 19) / 20;
-   LOGI("== send %d bytes in %d chunks ==", len, tx_left);
+   ctx->tx_left = (len + 19) / 20;
+   LOGI("== send %d bytes in %d chunks ==", len, ctx->tx_left);
    for (int o = 0; o < len; o += 20) {
       int c = len - o > 20 ? 20 : len - o;
       drv_write(U_ROUND, buf + o, c, 1);
    }
 }
 
-static void gen_token(void)
+/* Fill `dst` with n genuinely random bytes. Returns 0 if it could not.
+ *
+ * FAIL CLOSED, and share ONE implementation, because both call sites got this
+ * wrong in the same way: each swallowed an unopenable /dev/urandom and a short
+ * read into an empty if-body, then used the buffer regardless. Neither failure
+ * is survivable where these bytes go, and neither was visible.
+ *
+ * Callers must treat 0 as fatal for the connection. A refused connect retries
+ * on the next advert; predictable or uninitialised bytes on the air do not
+ * announce themselves. */
+static int rand_bytes(uint8_t *dst, int n)
 {
    int fd = open("/dev/urandom", O_RDONLY);
-   if (fd >= 0) {
-      if (read(fd, token, 8) != 8) {
-      }
-      close(fd);
-   }
+   if (fd < 0)
+      return 0;
+   long got = read(fd, dst, (unsigned)n);
+   close(fd);
+   return got == n;
+}
+
+/* Fresh 8-byte challenge token for this connection.
+ *
+ * The token is the ONLY thing that makes the sensor's AuthChallenge tokenHash
+ * fresh: with a constant token the expected hash is a constant per key, so a
+ * tokenHash once observed on air replays forever and the verification in
+ * driver_on_notify proves nothing. Before rand_bytes this left ctx->token at
+ * its previous value on failure -- on the first connection of a process, eight
+ * zero bytes, because ctx is zero-initialised. */
+static int gen_token(void)
+{
+   return rand_bytes(ctx->token, 8);
 }
 
 static void send_authrequest(void)
 {
-   gen_token();
+   if (!gen_token()) {
+      LOGI("!! no entropy for the auth token -- refusing to authenticate");
+      drv_status("NO ENTROPY");
+      ctx->phase = P_FAIL;
+      return;
+   }
+   /* Fresh token => any earlier verification is void. Clear it HERE, with the
+    * token it was computed against, so the flag can never outlive its input. */
+   ctx->chal_ok = 0;
    uint8_t m[10];
    m[0] = 0x02;
-   memcpy(m + 1, token, 8);
+   memcpy(m + 1, ctx->token, 8);
    m[9] = 0x02;
-   LOGI("== AuthRequest (02 token 02) ==");
+   LOGI("== AuthRequest (02 ctx->token 02) ==");
    drv_write(U_AUTH, m, 10, 0);
-   phase = P_AUTH;
+   ctx->phase = P_AUTH;
 }
 
 static void request_round(void)
 {
-   LOGI("== request J-PAKE round %d (0a %02x) ==", round_idx + 1, round_idx);
-   uint8_t m[2] = {0x0a, (uint8_t)round_idx};
-   rxlen        = 0;
+   LOGI("== request J-PAKE round %d (0a %02x) ==", ctx->round_idx + 1,
+        ctx->round_idx);
+   uint8_t m[2]    = {0x0a, (uint8_t)ctx->round_idx};
+   ctx->rxlen      = 0;
+   ctx->round_done = 0;
    drv_write(U_AUTH, m, 2, 0);
 }
 
@@ -193,18 +321,18 @@ static void send_our_round(void)
 {
    uint8_t pkt[160];
    int ok = 0;
-   if (round_idx == 0)
-      ok = dexpair_round1(pairing, pkt);
-   else if (round_idx == 1)
-      ok = dexpair_round2(pairing, pkt);
+   if (ctx->round_idx == 0)
+      ok = dexpair_round1(ctx->pairing, pkt);
+   else if (ctx->round_idx == 1)
+      ok = dexpair_round2(ctx->pairing, pkt);
    else
-      ok = dexpair_round3(pairing, pkt);
+      ok = dexpair_round3(ctx->pairing, pkt);
    if (!ok) {
-      LOGI("!! round%d build failed", round_idx + 1);
-      phase = P_FAIL;
+      LOGI("!! round%d build failed", ctx->round_idx + 1);
+      ctx->phase = P_FAIL;
       return;
    }
-   LOGI("== send our round %d ==", round_idx + 1);
+   LOGI("== send our round %d ==", ctx->round_idx + 1);
    send_chunks(pkt, 160);
 }
 
@@ -212,59 +340,91 @@ static void send_our_round(void)
  * char */
 static void start_cert(int idx)
 {
-   cert_idx     = idx;
-   cert_rx      = 0;
-   cert_size    = 0;
-   cert_sent    = 0;
-   int len      = idx == 0 ? DEX_CERT0_LEN : DEX_CERT1_LEN;
-   uint8_t m[6] = {0x0b,
-                   (uint8_t)idx,
-                   (uint8_t)len,
-                   (uint8_t)((unsigned)len >> 8U),
-                   (uint8_t)((unsigned)len >> 16U),
-                   (uint8_t)((unsigned)len >> 24U)};
+   ctx->cert_idx  = idx;
+   ctx->cert_rx   = 0;
+   ctx->cert_size = 0;
+   ctx->cert_sent = 0;
+   int len        = idx == 0 ? DEX_CERT0_LEN : DEX_CERT1_LEN;
+   uint8_t m[6]   = {0x0b,
+                     (uint8_t)idx,
+                     (uint8_t)len,
+                     (uint8_t)((unsigned)len >> 8U),
+                     (uint8_t)((unsigned)len >> 16U),
+                     (uint8_t)((unsigned)len >> 24U)};
    LOGI("== certificate %d: announce (0b %02x len=%d) ==", idx, idx, len);
    drv_write(U_AUTH, m, 6, 0);
-   phase = P_CERT;
+   ctx->phase = P_CERT;
 }
 
 static void start_keychallenge(void)
 {
    LOGI("== key challenge (0c + random16) ==");
    uint8_t m[17];
-   m[0]   = 0x0c;
-   int fd = open("/dev/urandom", O_RDONLY);
-   if (fd >= 0) {
-      if (read(fd, m + 1, 16) != 16) {
-      }
-      close(fd);
+   m[0] = 0x0c;
+   /* m is an UNINITIALISED stack buffer, so failing to fill m[1..16] used to
+    * transmit 16 bytes of whatever the stack last held -- leaking process
+    * memory over the air and, worse, sending a key challenge that is not
+    * random at all. The old code swallowed both /dev/urandom failures into an
+    * empty if-body and wrote m regardless. */
+   if (!rand_bytes(m + 1, 16)) {
+      LOGI("!! no entropy for the key challenge -- refusing to bond");
+      drv_status("NO ENTROPY");
+      ctx->phase = P_FAIL;
+      return;
    }
-   cert_rx = 0; /* accumulate the sensor's 64-byte challenge blob */
+   ctx->cert_rx        = 0; /* accumulate the sensor's 64-byte blob */
+   ctx->keychal_signed = 0;
    drv_write(U_AUTH, m, 17, 0);
-   phase = P_KEYCHAL;
+   ctx->phase = P_KEYCHAL;
 }
 
 static void goto_stream(void)
 {
-   LOGI("phase -> SUB2 (enable ctrl+data CCCDs, then getdata)");
-   phase   = P_SUB2;
-   sub_idx = 0;
+   LOGI("ctx->phase -> SUB2 (enable ctrl+data CCCDs, then getdata)");
+   ctx->phase   = P_SUB2;
+   ctx->sub_idx = 0;
    drv_subscribe(sub2[0].uuid, sub2[0].indicate);
 }
 
 void driver_init(void)
 {
    dexauth_init();
-   uint8_t k[16];
-   if (drv_key_load(k)) {
-      memcpy(shared_key, k, 16);
-      have_key = 1;
-      LOGI("loaded saved key");
+   /* Establish the documented "-1 = none yet" sentinel for every link.
+    *
+    * g_dctx is a zero-initialised static, and only driver_forget ever set
+    * this -- so on a fresh process with a saved key, tapping READ BOUNDS set
+    * cal.have without touching result, and the UI rendered "LAST RESULT 0x00"
+    * in green: a calibration submitted and accepted, when none ever was. */
+   for (int l = 0; l < LINK_MAX; l++)
+      g_dctx[l].cal.result = -1;
+   /* EVERY CGM link, not just the ambient one.
+    *
+    * The key and MAC files are per-link (stelo.key, stelo.key.2, ...), but this
+    * used to load only whichever context happened to be selected -- always
+    * LINK_CGM at startup. So links 2..N began every process with have_key = 0
+    * and an empty MAC: a second CGM's advert hit the "no saved MAC" guard and
+    * was never reconnected, and had it connected it would have demanded a fresh
+    * J-PAKE pairing with an applicator code the user no longer has. A second
+    * sensor therefore went silent at the first app restart, permanently. */
+   driver_lock();
+   int prev = driver_link();
+   for (int l = 0; l < LINK_MAX; l++) {
+      if (l == LINK_METER)
+         continue;
+      driver_select(l);
+      uint8_t k[16];
+      if (drv_key_load(k)) {
+         memcpy(ctx->shared_key, k, 16);
+         ctx->have_key = 1;
+         LOGI("link %d: loaded saved key", l);
+      }
+      /* Reconnect only to sensors we have bonded to: pre-load each link's MAC
+       * so the app locks onto those exact devices and never touches another. */
+      if (drv_mac_load(ctx->g_mac, (int)sizeof ctx->g_mac))
+         LOGI("link %d: locked to saved sensor %s", l, ctx->g_mac);
    }
-   /* Reconnect only to the sensor we last bonded to: pre-load its MAC so the
-    * app locks onto that exact device and never touches another Dexcom. */
-   if (drv_mac_load(g_mac, (int)sizeof g_mac))
-      LOGI("locked to saved sensor %s", g_mac);
+   driver_select(prev);
+   driver_unlock();
 }
 
 /* Set the reconnect target MAC without initiating a connection. Used at startup
@@ -275,33 +435,47 @@ void driver_lock_mac(const char *mac)
 {
    int i = 0;
    for (; mac[i] && i < 23; i++)
-      g_mac[i] = mac[i];
-   g_mac[i] = 0;
+      ctx->g_mac[i] = mac[i];
+   ctx->g_mac[i] = 0;
 }
 
 void driver_start(const char *mac, const char *code)
 {
    int i = 0;
    for (; mac[i] && i < 23; i++)
-      g_mac[i] = mac[i];
-   g_mac[i]  = 0;
-   g_codelen = 0;
-   for (int j = 0; code[j] && g_codelen < 8; j++)
-      g_code[g_codelen++] = (uint8_t)code[j];
-   phase = P_IDLE;
-   drv_status(have_key ? "WAITING" : "PAIRING");
-   LOGI("driver_start mac=%s code(len=%d) have_key=%d", g_mac, g_codelen,
-        have_key);
-   drv_connect(g_mac);
+      ctx->g_mac[i] = mac[i];
+   ctx->g_mac[i]  = 0;
+   ctx->g_codelen = 0;
+   for (int j = 0; code[j] && ctx->g_codelen < 8; j++)
+      ctx->g_code[ctx->g_codelen++] = (uint8_t)code[j];
+   ctx->phase = P_IDLE;
+   drv_status(ctx->have_key ? "WAITING" : "PAIRING");
+   LOGI("driver_start mac=%s code(len=%d) ctx->have_key=%d", ctx->g_mac,
+        ctx->g_codelen, ctx->have_key);
+   drv_connect(ctx->g_mac);
 }
 
 void driver_on_connected(void)
 {
+   /* Free any pairing context from a previous attempt BEFORE re-walking the
+    * subscribe sequence.
+    *
+    * This resets phase unconditionally, and a second on_connected without an
+    * intervening disconnect overwrites ctx->pairing further down -- orphaning
+    * a block that dexpair_free exists to memset. That leaks the J-PAKE
+    * secrets (xA, xB, vA, vB, v3 and the passphrase-derived scalar) unwiped in
+    * a process that runs for days. It is peer-reachable: Ble calls
+    * discoverServices() on any onMtuChanged, including a peer-initiated MTU
+    * exchange, and discovery completion calls back in here. */
+   if (ctx->pairing) {
+      dexpair_free(ctx->pairing);
+      ctx->pairing = NULL;
+   }
    LOGI("<< connected: services ready");
    drv_status("CONNECTED");
-   phase   = P_SUB1;
-   sub_idx = 0;
-   LOGI("phase -> SUB1 (enable auth+round CCCDs)");
+   ctx->phase   = P_SUB1;
+   ctx->sub_idx = 0;
+   LOGI("ctx->phase -> SUB1 (enable auth+round CCCDs)");
    drv_subscribe(sub1[0].uuid, sub1[0].indicate);
 }
 
@@ -310,84 +484,100 @@ void driver_on_connected(void)
  * the official one. drv_connect uses autoConnect=true, a passive wait for the
  * sensor's next advertisement, so even a long run of failures is gentle: there
  * is no active scanning and no connect storm, just one armed reconnect at a
- * time. fails is kept only for logging the current streak. */
-#define MAX_FAILS 15  /* connect-but-no-stream cap; pause to stop hammering */
-static int fails;     /* consecutive connects that never streamed */
-static int authfails; /* subset: failures after we reached auth/cert */
+ * time. ctx->fails is kept only for logging the current streak. */
+#define MAX_FAILS 15 /* connect-but-no-stream cap; pause to stop hammering */
 
 void driver_on_disconnected(int status)
 {
-   LOGI("<< disconnected status=%d in phase=%s (streamed=%d)", status,
-        phase_name(phase), streamed);
-   int did_stream = streamed;
-   streamed       = 0;
-   if (pairing) {
-      dexpair_free(pairing);
-      pairing = NULL;
+   LOGI("<< disconnected status=%d in ctx->phase=%s (ctx->streamed=%d)", status,
+        phase_name(ctx->phase), ctx->streamed);
+   int did_stream = ctx->streamed;
+   ctx->streamed  = 0;
+   if (ctx->pairing) {
+      dexpair_free(ctx->pairing);
+      ctx->pairing = NULL;
    }
-   int was = phase;
-   phase   = P_IDLE;
+   int was    = ctx->phase;
+   ctx->phase = P_IDLE;
    if (did_stream) {
-      fails     = 0;
-      authfails = 0;
+      ctx->fails     = 0;
+      ctx->authfails = 0;
    } else {
-      fails++;
-      /* Authenticated (reached auth/cert/keychal) but never streamed. If this
-       * repeats with a stored key, the key is stale -- another app (e.g. the
-       * official Stelo app) re-paired the sensor. Drop the key so the next
-       * connect re-pairs from scratch via the J-PAKE rounds (have_key=0 path).
+      ctx->fails++;
+      /* Authenticated (reached auth/cert/keychal) but never ctx->streamed. If
+       * this repeats with a stored key, the key is stale -- another app (e.g.
+       * the official Stelo app) re-paired the sensor. Drop the key so the next
+       * connect re-pairs from scratch via the J-PAKE rounds (ctx->have_key=0
+       * path).
        */
-      if (have_key && (was == P_AUTH || was == P_CERT || was == P_KEYCHAL) &&
-          ++authfails >= 3) {
+      if (ctx->have_key &&
+          (was == P_AUTH || was == P_CERT || was == P_KEYCHAL) &&
+          ++ctx->authfails >= 3) {
          LOGI("!! %d post-auth failures with a key -> discard key, re-pair",
-              authfails);
-         have_key  = 0;
-         authfails = 0;
+              ctx->authfails);
+         ctx->have_key  = 0;
+         ctx->authfails = 0;
          drv_key_clear();
       }
    }
    /* Note: out-of-range does NOT count here -- autoConnect just waits for the
-    * next advert without a failed connection. fails climbs only when we connect
-    * yet can't stream, so the cap catches a genuine loop, not a quiet sensor.
+    * next advert without a failed connection. ctx->fails climbs only when we
+    * connect yet can't stream, so the cap catches a genuine loop, not a quiet
+    * sensor.
     */
-   if (fails >= MAX_FAILS) {
+   if (ctx->fails >= MAX_FAILS) {
       LOGI("!! %d straight failures -- pausing to avoid hammering (relaunch to "
            "retry)",
-           fails);
+           ctx->fails);
       drv_status("CONNECTION ERROR");
-   } else if (have_key || g_codelen > 0) {
-      drv_status(have_key ? "WAITING" : "RE-PAIRING");
-      LOGI("reconnect to %s (fail streak %d, was=%s)", g_mac, fails,
+   } else if (ctx->have_key || ctx->g_codelen > 0) {
+      drv_status(ctx->have_key ? "WAITING" : "RE-PAIRING");
+      LOGI("reconnect to %s (fail streak %d, was=%s)", ctx->g_mac, ctx->fails,
            phase_name(was));
-      drv_connect(g_mac);
+      drv_connect(ctx->g_mac);
    } else {
       LOGI("no key/code -- not reconnecting (was=%s)", phase_name(was));
       drv_status("CONNECTION ERROR");
    }
 }
 
-/* Forget the paired sensor: drop the shared key/bond and reset all pairing
+/* Forget the paired sensor: drop the shared key/bond and reset all ctx->pairing
  * state so the next connection pairs from scratch (J-PAKE) with a fresh code.
  * Used by "PAIR NEW SENSOR" -- the caller then re-arms scanning for the new
  * one.
  */
 void driver_forget(void)
 {
-   if (pairing) {
-      dexpair_free(pairing);
-      pairing = NULL;
+   if (ctx->pairing) {
+      dexpair_free(ctx->pairing);
+      ctx->pairing = NULL;
    }
-   have_key   = 0;
-   g_bonded   = 0;
-   g_codelen  = 0;
-   did_rounds = 0;
-   fails      = 0;
-   authfails  = 0;
-   phase      = P_IDLE;
-   mac_saved  = 0;
+   /* Wipe the key, do not merely stop trusting it: this context is a
+    * long-lived global, so "forget" left the 16 bytes readable in memory. */
+   memset(ctx->shared_key, 0, sizeof ctx->shared_key);
+   ctx->have_key   = 0;
+   ctx->g_bonded   = 0;
+   ctx->g_codelen  = 0;
+   ctx->did_rounds = 0;
+   ctx->fails      = 0;
+   ctx->authfails  = 0;
+   ctx->phase      = P_IDLE;
+   ctx->mac_saved  = 0;
    drv_key_clear();
    drv_mac_clear();
-   g_mac[0] = 0; /* unlock: allow pairing a different sensor */
+   ctx->g_mac[0] = 0; /* unlock: allow ctx->pairing a different sensor */
+   /* Clear the SESSION as well. driver_get_session() otherwise still reported
+    * the previous sensor's clock, and sensor_reconcile derives activation from
+    * it -- so a sensor paired right after a forget was stamped with the old
+    * one's start time, permanently, in a file that is never rewritten. */
+   ctx->last_clock     = 0;
+   ctx->last_age       = 0;
+   ctx->last_glucose   = 0;
+   ctx->last_trend     = 0;
+   ctx->last_predicted = 0;
+   ctx->last_seq       = 0;
+   ctx->streamed       = 0;
+   ctx->cal            = (struct dex_cal){.result = -1};
    LOGI("driver_forget: key/bond dropped, ready to pair a new sensor");
 }
 
@@ -397,30 +587,32 @@ void driver_forget(void)
  * A no-op while actively streaming, so it never disturbs a healthy cycle. */
 void driver_kick(void)
 {
-   if (phase == P_STREAM)
+   if (ctx->phase == P_STREAM)
       return;
-   if (have_key || g_codelen > 0) {
-      phase = P_IDLE;
+   if (ctx->have_key || ctx->g_codelen > 0) {
+      ctx->phase = P_IDLE;
       /* Clear the give-up counters so the watchdog can always revive a link
-       * that hit MAX_FAILS (e.g. a sensor that connected but never streamed
-       * during warmup); otherwise fails stays >= MAX_FAILS and every cycle
-       * re-shows CONNECTION ERROR with no reconnect. */
-      fails     = 0;
-      authfails = 0;
-      LOGI("driver_kick: forcing a fresh reconnect to %s", g_mac);
-      drv_connect(g_mac);
+       * that hit MAX_FAILS (e.g. a sensor that connected but never
+       * ctx->streamed during warmup); otherwise ctx->fails stays >= MAX_FAILS
+       * and every cycle re-shows CONNECTION ERROR with no reconnect. */
+      ctx->fails     = 0;
+      ctx->authfails = 0;
+      LOGI("driver_kick: forcing a fresh reconnect to %s", ctx->g_mac);
+      drv_connect(ctx->g_mac);
    }
 }
 
 /* Recover a gap: request records from (now - span) up to just before the
  * current reading. Endpoints are sensor session-time, mapped from the latest
- * 4e (last_clock/last_age). span is clamped to the sensor's ~24h buffer. */
+ * 4e (ctx->last_clock/ctx->last_age). span is clamped to the sensor's ~24h
+ * buffer.
+ */
 void driver_request_backfill(long span)
 {
-   if (phase != P_STREAM || last_clock == 0)
+   if (ctx->phase != P_STREAM || ctx->last_clock == 0)
       return;
-   long end =
-       (long)last_clock - (long)last_age; /* current reading, session-time */
+   long end = (long)ctx->last_clock -
+              (long)ctx->last_age; /* current reading, session-time */
    if (end <= 1)
       return;
    if (span > 86400)
@@ -446,122 +638,281 @@ void driver_request_backfill(long span)
    drv_write(U_CTRL, m, 9, 0);
 }
 
+/* ---- calibration ---- */
+
+void driver_get_cal(struct dex_cal *out)
+{
+   *out = ctx->cal;
+}
+
+void driver_cal_bounds(void)
+{
+   if (ctx->phase != P_STREAM) {
+      LOGI("== ctx->cal bounds: not streaming, ignored ==");
+      return;
+   }
+   uint8_t m[1]   = {0x32};
+   ctx->cal.asked = realtime_s();
+   LOGI("== ctx->cal bounds request 32 ==");
+   drv_write(U_CTRL, m, 1, 0);
+}
+
+/* Returns 1 if the calibration write was actually issued, 0 if refused. The
+ * shell uses this to keep a confirmed calibration QUEUED and retry it later
+ * rather than dropping it -- a refusal here is transient (not yet streaming, or
+ * the 0x32 permission not yet parsed), so it must never lose the value. */
+int driver_calibrate(int mg_dl)
+{
+   if (ctx->phase != P_STREAM || ctx->last_clock == 0) {
+      LOGI("== calibrate: not streaming, deferred ==");
+      return 0;
+   }
+   /* Refuse a value the sensor would reject anyway, and refuse before we know
+    * the firmware permits it -- so a stale UI can never push a blind write. */
+   if (mg_dl < 40 || mg_dl > 400) {
+      LOGI("== calibrate: %d out of range, refused ==", mg_dl);
+      return 0;
+   }
+   /* Require a POSITIVE answer from 0x32, not merely the absence of a negative
+    * one. `have && !permitted` let a calibration through whenever the bounds
+    * probe had not answered yet -- which is exactly the blind write the
+    * comment above says is refused, and the Stelo may well never answer 0x32
+    * at all. The UI gates on cal_permitted for the same reason; this is the
+    * driver-side backstop so no other caller can bypass it. */
+   if (!ctx->cal.have || !ctx->cal.permitted) {
+      LOGI("== calibrate: not permitted (have=%d permitted=%d) ==",
+           ctx->cal.have, ctx->cal.permitted);
+      return 0;
+   }
+   uint32_t when = ctx->last_clock; /* sensor clock, seconds since activation */
+   uint16_t g    = (uint16_t)mg_dl;
+   /* G7 framing: opcode, glucose u16 LE, time u32 LE. No CRC. */
+   uint8_t m[7] = {0x34,
+                   (uint8_t)g,
+                   (uint8_t)(g >> 8U),
+                   (uint8_t)when,
+                   (uint8_t)(when >> 8U),
+                   (uint8_t)(when >> 16U),
+                   (uint8_t)(when >> 24U)};
+   loghex("== CALIBRATE 34", m, 7);
+   ctx->cal.result  = -1; /* fresh: -1 awaiting, 0 accepted, >0 rejected */
+   ctx->cal_pending = 1;
+   drv_write(U_CTRL, m, 7, 0);
+   return 1;
+}
+
 void driver_on_written(const char *uuid, int status)
 {
-   LOGI("<< onWritten %.8s status=%d phase=%s", uuid, status,
-        phase_name(phase));
-   if (phase == P_SUB1) {
-      if (strcmp(uuid, sub1[sub_idx].uuid) != 0) {
+   LOGI("<< onWritten %.8s status=%d ctx->phase=%s", uuid, status,
+        phase_name(ctx->phase));
+   if (ctx->phase == P_SUB1) {
+      if (strcmp(uuid, sub1[ctx->sub_idx].uuid) != 0) {
          LOGI("   (ignore stray ack)");
          return;
       }
-      if (++sub_idx < NSUB1) {
-         drv_subscribe(sub1[sub_idx].uuid, sub1[sub_idx].indicate);
-      } else if (have_key) {
-         did_rounds = 0;
+      if (++ctx->sub_idx < NSUB1) {
+         drv_subscribe(sub1[ctx->sub_idx].uuid, sub1[ctx->sub_idx].indicate);
+      } else if (ctx->have_key) {
+         ctx->did_rounds = 0;
          send_authrequest();
       } else {
-         did_rounds = 1;
-         pairing    = dexpair_new(g_code, g_codelen, 1);
-         round_idx  = 0;
-         phase      = P_ROUNDS;
+         ctx->did_rounds = 1;
+         ctx->pairing    = dexpair_new(ctx->g_code, ctx->g_codelen, 1);
+         if (!ctx->pairing) { /* allocation failed; the round handlers would
+                                 dereference it unguarded */
+            LOGI("!! pairing alloc failed");
+            ctx->phase = P_FAIL;
+            return;
+         }
+         ctx->round_idx = 0;
+         ctx->phase     = P_ROUNDS;
          request_round();
       }
-   } else if (phase == P_ROUNDS) {
-      if (!strcmp(uuid, U_ROUND) && tx_left > 0) {
-         tx_left--;
-         if (tx_left == 0) {
-            if (++round_idx < 3) {
+   } else if (ctx->phase == P_ROUNDS) {
+      if (!strcmp(uuid, U_ROUND) && ctx->tx_left > 0) {
+         ctx->tx_left--;
+         if (ctx->tx_left == 0) {
+            if (++ctx->round_idx < 3) {
                request_round();
-            } else if (!dexpair_shared_key(pairing, shared_key)) {
+            } else if (!dexpair_shared_key(ctx->pairing, ctx->shared_key)) {
                LOGI("!! sharedkey fail");
-               phase = P_FAIL;
+               ctx->phase = P_FAIL;
             } else {
-               have_key = 1;
-               loghex("SHAREDKEY(derived)", shared_key, 16);
-               drv_key_save(shared_key);
+               ctx->have_key = 1;
+               loghex("SHAREDKEY(derived)", ctx->shared_key, 16);
+               drv_key_save(ctx->shared_key);
                send_authrequest();
             }
          }
       }
-   } else if (phase == P_CERT) {
+   } else if (ctx->phase == P_CERT) {
       /* our cert chunks being acked; when all sent, next cert or key challenge
        */
-      if (!strcmp(uuid, U_ROUND) && tx_left > 0) {
-         tx_left--;
-         if (tx_left == 0) {
-            if (cert_idx == 0)
+      if (!strcmp(uuid, U_ROUND) && ctx->tx_left > 0) {
+         ctx->tx_left--;
+         if (ctx->tx_left == 0) {
+            if (ctx->cert_idx == 0)
                start_cert(1);
             else
                start_keychallenge();
          }
       }
-   } else if (phase == P_KEYCHAL) {
+   } else if (ctx->phase == P_KEYCHAL) {
       /* our signature chunks acked; when all sent, write 0d 00 02 */
-      if (!strcmp(uuid, U_ROUND) && tx_left > 0) {
-         tx_left--;
-         if (tx_left == 0) {
+      if (!strcmp(uuid, U_ROUND) && ctx->tx_left > 0) {
+         ctx->tx_left--;
+         if (ctx->tx_left == 0) {
             uint8_t m[3] = {0x0d, 0x00, 0x02};
             LOGI("   -> challenge out (0d 00 02)");
             drv_write(U_AUTH, m, 3, 0);
          }
       }
-   } else if (phase == P_SUB2) {
-      if (strcmp(uuid, sub2[sub_idx].uuid) != 0) {
+   } else if (ctx->phase == P_SUB2) {
+      if (strcmp(uuid, sub2[ctx->sub_idx].uuid) != 0) {
          LOGI("   (ignore stray ack)");
          return;
       }
-      if (++sub_idx < NSUB2) {
-         drv_subscribe(sub2[sub_idx].uuid, sub2[sub_idx].indicate);
+      if (++ctx->sub_idx < NSUB2) {
+         drv_subscribe(sub2[ctx->sub_idx].uuid, sub2[ctx->sub_idx].indicate);
       } else {
          LOGI("== get data (write 4e) ==");
          uint8_t c = 0x4e;
          drv_write(U_CTRL, &c, 1, 0);
-         phase = P_STREAM;
+         ctx->phase = P_STREAM;
       }
    }
 }
 
 void driver_on_notify(const char *uuid, const uint8_t *buf, int n)
 {
-   LOGI("<< onNotify %.8s phase=%s", uuid, phase_name(phase));
+   LOGI("<< onNotify %.8s ctx->phase=%s", uuid, phase_name(ctx->phase));
    loghex("   ", buf, n);
-   if (phase == P_ROUNDS && !strcmp(uuid, U_ROUND)) {
-      if (rxlen + n <= 160) {
-         memcpy(rxbuf + rxlen, buf, n);
-         rxlen += n;
+   if (ctx->phase == P_ROUNDS && !strcmp(uuid, U_ROUND)) {
+      /* Copy what fits rather than dropping an oversized notify whole. The MTU
+       * is 185, so a 160-byte round can arrive in chunks that straddle the
+       * boundary; dropping one left rxlen stuck below 160, the completion test
+       * never fired, and pairing hung with no timeout -- the stall watchdog is
+       * gated on `paired`, which is 0 during first-time pairing. */
+      int room = 160 - ctx->rxlen;
+      if (room > 0) {
+         int take = n < room ? n : room;
+         memcpy(ctx->rxbuf + ctx->rxlen, buf, (size_t)take);
+         ctx->rxlen += take;
       }
-      if (rxlen >= 160) {
-         int ok = 0;
-         if (round_idx == 0)
-            ok = dexpair_peer_round1(pairing, rxbuf);
-         else if (round_idx == 1)
-            ok = dexpair_peer_round2(pairing, rxbuf);
+      /* Handle each completed round EXACTLY once. rxlen is only reset by
+       * request_round(), which does not run until our last chunk is acked, so
+       * it stays pinned at 160 in between. Any further U_ROUND notify in that
+       * window (a peer retransmit, or a stray frame from a hostile peer on the
+       * link) re-ran the ZKP on the stale buffer and called send_chunks again,
+       * resetting tx_left to 8 while 8 writes were still in flight. The acks
+       * then no longer matched the outstanding writes: tx_left hit 0 early,
+       * the remaining acks were dropped, round_idx never advanced, and pairing
+       * stalled forever -- with no timeout, because the stall watchdog is gated
+       * on `paired`, which is 0 during first-time pairing. P_CERT already has
+       * this guard as cert_sent; this is the missing equivalent. */
+      if (ctx->rxlen >= 160 && !ctx->round_done) {
+         ctx->round_done = 1;
+         int ok          = 0;
+         if (ctx->round_idx == 0)
+            ok = dexpair_peer_round1(ctx->pairing, ctx->rxbuf);
+         else if (ctx->round_idx == 1)
+            ok = dexpair_peer_round2(ctx->pairing, ctx->rxbuf);
          else
-            ok = dexpair_peer_round3(pairing, rxbuf);
-         LOGI("   peer round%d ZKP %s", round_idx + 1,
-              ok ? "VALID" : "INVALID(continuing)");
+            ok = dexpair_peer_round3(ctx->pairing, ctx->rxbuf);
+         /* ENFORCE the peer's Schnorr ZKP (RFC-8235: g^r + X^H == V). A genuine
+          * sensor's proofs always verify -- they attest knowledge of the round
+          * ephemerals, independent of the pairing code -- so a failure means a
+          * malformed or hostile peer whose round data must NOT be folded into
+          * the shared key. This used to log "INVALID(continuing)" and derive
+          * the key anyway; the later dex8 tokenHash gate would reject the wrong
+          * key, but the spec check belongs here and refusing early avoids
+          * emitting our own round to a peer that already failed. */
+         if (!ok) {
+            LOGI("!! peer round%d ZKP INVALID -- refusing to pair",
+                 ctx->round_idx + 1);
+            drv_status("PAIR FAILED");
+            ctx->phase = P_FAIL;
+            return;
+         }
+         LOGI("   peer round%d ZKP VALID", ctx->round_idx + 1);
          send_our_round();
       }
-   } else if (phase == P_AUTH && !strcmp(uuid, U_AUTH)) {
+   } else if (ctx->phase == P_AUTH && !strcmp(uuid, U_AUTH)) {
       if (n >= 17 && buf[0] == 0x03) {
-         LOGI("   AuthChallenge (03) -> ChallengeReply (04)");
+         /* VERIFY THE SENSOR FIRST. The frame is
+          *   03 <tokenHash8> <challenge8>
+          * where tokenHash is the peer's proof that it holds the shared key,
+          * computed over the token WE generated for this connection. Answering
+          * without checking it made authentication one-way: any peer
+          * presenting the locked MAC could reply 03 + 16 arbitrary bytes, then
+          * 05 01 01, and reach P_STREAM -- after which its 0x4e frames became
+          * real glucose, feeding the big number, the ALARM, and the permanent
+          * log. A spoofed sensor could mask a hypo.
+          *
+          * Replying unconditionally was also a chosen-plaintext oracle: the
+          * peer picks buf[9..16] and gets AES-ECB(key, c||c)[:8] back.
+          *
+          * This check existed in test/dexsession.c, a file no build target
+          * ever compiled -- so it protected nothing. That file is now deleted
+          * and the check lives here, exercised by test_driver.c's spoofed-peer
+          * and skipped-AuthChallenge cases. */
+         uint8_t expect[8];
+         dexauth_dex8(ctx->shared_key, ctx->token, expect);
+         if (memcmp(expect, buf + 1, 8) != 0) {
+            LOGI(
+                "!! AuthChallenge tokenHash MISMATCH -- peer does not hold the "
+                "shared key; refusing");
+            drv_status("AUTH FAILED");
+            /* Run the stale-key recovery HERE, because setting P_FAIL below
+             * takes us out of P_AUTH and driver_on_disconnected's
+             * `was == P_AUTH` test would then never fire.
+             *
+             * A tokenHash mismatch means the peer does not hold our key --
+             * exactly the "something else re-paired this sensor, our saved key
+             * is stale" condition that the authfails >= 3 -> drv_key_clear()
+             * recovery exists for. Without this the link looped
+             * connect -> refuse -> drop forever, recoverable only by a manual
+             * forget plus the applicator code the user may no longer have. */
+            if (ctx->have_key && ++ctx->authfails >= 3) {
+               LOGI("!! %d auth failures -- discarding the saved key so the "
+                    "sensor can be re-paired",
+                    ctx->authfails);
+               ctx->have_key  = 0;
+               ctx->authfails = 0;
+               drv_key_clear();
+            }
+            ctx->phase = P_FAIL;
+            return;
+         }
+         LOGI("   AuthChallenge (03) verified -> ChallengeReply (04)");
+         ctx->chal_ok = 1;
          uint8_t reply[9];
          reply[0] = 0x04;
-         dexauth_dex8(shared_key, buf + 9, reply + 1);
+         dexauth_dex8(ctx->shared_key, buf + 9, reply + 1);
          drv_write(U_AUTH, reply, 9, 0);
       } else if (n >= 3 && buf[0] == 0x05) {
-         int auth = buf[1];
-         int bond = buf[2];
-         g_bonded = (auth == 1);
+         int auth      = buf[1];
+         int bond      = buf[2];
+         ctx->g_bonded = (auth == 1);
          LOGI("   AuthStatus (05) auth=%02x bond=%02x", auth, bond);
          if (auth == 0) {
             LOGI("!! auth failed");
             drv_status("AUTH FAILED");
-            phase = P_FAIL;
-         } else if (did_rounds || auth != 1) {
+            ctx->phase = P_FAIL;
+         } else if (!ctx->chal_ok) {
+            /* THE PEER NEVER PROVED IT HOLDS THE KEY. A genuine sensor always
+             * sends AuthChallenge (03) before AuthStatus (05) -- that is the
+             * captured order in both the pairing and the bonded-reconnect
+             * flow. Accepting 05 on its own let a peer on the locked MAC skip
+             * the proof entirely and reach P_STREAM, after which its 4e frames
+             * became the headline number, the alarm input, and permanent rows
+             * in readings.csv. */
+            LOGI("!! AuthStatus without a verified AuthChallenge -- refusing");
+            drv_status("AUTH FAILED");
+            ctx->phase = P_FAIL;
+         } else if (ctx->did_rounds || auth != 1) {
             /* establish/refresh the bond via the certificate exchange */
-            drv_status(did_rounds ? "PAIRED" : "BONDING");
+            drv_status(ctx->did_rounds ? "PAIRED" : "BONDING");
             start_cert(0);
          } else {
             LOGI("   bonded reconnect -> stream");
@@ -569,33 +920,35 @@ void driver_on_notify(const char *uuid, const uint8_t *buf, int n)
             goto_stream();
          }
       }
-   } else if (phase == P_CERT) {
+   } else if (ctx->phase == P_CERT) {
       if (!strcmp(uuid, U_AUTH) && n >= 7 && buf[0] == 0x0b) {
-         /* size announce; don't reset cert_rx -- the sensor streams some cert
-          * chunks before this arrives (start_cert already zeroed it). le32 is
-          * unsigned; clamp so a garbage/huge size can't become a negative int
-          * that defeats the completion test below. */
-         uint32_t sz = le32(buf + 3);
-         cert_size   = sz > 0x7fffffffU ? 0 : (int)sz;
-         LOGI("   sensor cert %d size=%d (rx so far %d)", cert_idx, cert_size,
-              cert_rx);
+         /* size announce; don't reset ctx->cert_rx -- the sensor streams some
+          * cert chunks before this arrives (start_cert already zeroed it). le32
+          * is unsigned; clamp so a garbage/huge size can't become a negative
+          * int that defeats the completion test below. */
+         uint32_t sz    = le32(buf + 3);
+         ctx->cert_size = sz > 0x7fffffffU ? 0 : (int)sz;
+         LOGI("   sensor cert %d size=%d (rx so far %d)", ctx->cert_idx,
+              ctx->cert_size, ctx->cert_rx);
          /* If every chunk already arrived before this announce, the U_ROUND
           * branch will get no further notify -- complete it here too, or P_CERT
           * stalls until the link drops. */
          cert_maybe_complete();
       } else if (!strcmp(uuid, U_ROUND)) {
-         cert_rx += n;
+         ctx->cert_rx += n;
          cert_maybe_complete();
       }
-   } else if (phase == P_KEYCHAL) {
-      if (!strcmp(uuid, U_AUTH) && n >= 18 && buf[0] == 0x0c) {
+   } else if (ctx->phase == P_KEYCHAL) {
+      if (!strcmp(uuid, U_AUTH) && n >= 18 && buf[0] == 0x0c &&
+          !ctx->keychal_signed) {
+         ctx->keychal_signed = 1;
          LOGI("   sensor key-challenge; signing (ECDSA)");
          uint8_t sig[64];
          if (dexauth_getchallenge(buf, (size_t)n, sig)) {
             send_chunks(sig, 64);
          } else {
             LOGI("!! sign failed");
-            phase = P_FAIL;
+            ctx->phase = P_FAIL;
          }
       } else if (!strcmp(uuid, U_AUTH) && n >= 3 && buf[0] == 0x0d) {
          LOGI("   challenge accepted (0d); -> time-extended (06 1e)");
@@ -605,21 +958,53 @@ void driver_on_notify(const char *uuid, const uint8_t *buf, int n)
       }
       /* sensor's 64-byte challenge blob on the round char is
        * accumulated/ignored */
-   } else if (phase == P_STREAM) {
+   } else if (ctx->phase == P_STREAM) {
       if (!strcmp(uuid, U_CTRL) && n >= 19 && buf[0] == 0x4e) {
          struct dex_egv ev;
          if (dexdata_egv(buf, (size_t)n, &ev)) {
-            last_clock     = ev.clock;
-            last_age       = ev.age;
-            last_glucose   = ev.glucose;
-            last_trend     = (int)ev.trend;
-            last_predicted = ev.predicted;
-            last_seq       = ev.sequence;
+            ctx->last_clock     = ev.clock;
+            ctx->last_age       = ev.age;
+            ctx->last_glucose   = ev.glucose;
+            ctx->last_trend     = (int)ev.trend;
+            ctx->last_predicted = ev.predicted;
+            ctx->last_seq       = ev.sequence;
             LOGI("   EGV glucose=%d age=%d trend=%d clock=%u", ev.glucose,
                  ev.age, ev.trend, ev.clock);
             drv_glucose(ev.glucose, ev.trend, ev.age);
-            streamed = 1;
+            ctx->streamed = 1;
             remember_sensor();
+         }
+      } else if (!strcmp(uuid, U_CTRL) && n >= 15 && buf[0] == 0x32) {
+         /* calibration bounds; byte offsets confirmed against a live capture */
+         ctx->cal.have    = 1;
+         ctx->cal.last_bg = (int)((unsigned)buf[7] | ((unsigned)buf[8] << 8U));
+         ctx->cal.last_cal =
+             (long)((uint32_t)buf[9] | ((uint32_t)buf[10] << 8U) |
+                    ((uint32_t)buf[11] << 16U) | ((uint32_t)buf[12] << 24U));
+         ctx->cal.status    = buf[13];
+         ctx->cal.permitted = buf[14] != 0;
+         loghex("   CAL BOUNDS 32", buf, n);
+         LOGI("   permitted=%d status=%d lastBG=%d", ctx->cal.permitted,
+              ctx->cal.status, ctx->cal.last_bg);
+      } else if (!strcmp(uuid, U_CTRL) && n >= 2 && buf[0] == 0x34) {
+         /* Reply reuses the request opcode on this generation. Log the raw
+          * bytes whatever the status: this response code is the thing no
+          * public capture of a Stelo has recorded. */
+         ctx->cal.result = buf[1];
+         loghex("   CALIBRATE REPLY 34", buf, n);
+         LOGI("   calibration result=0x%02x (%s)", ctx->cal.result,
+              ctx->cal.result == 0 ? "accepted" : "not accepted");
+         /* Re-read the bounds ONLY for a calibration we sent. An unsolicited
+          * 0x34 is either an echo or a hostile peer; answering it with a 0x32
+          * write is what makes the exchange self-sustaining. */
+         if (ctx->cal_pending) {
+            ctx->cal_pending = 0;
+            driver_cal_bounds(); /* so the UI shows the new state */
+            /* Tell the shell the OUTCOME so it can clear (accepted) or surface
+             * (rejected) the durably-queued calibration -- never a silent drop. */
+            drv_cal_result(ctx->cal.result);
+         } else {
+            LOGI("   unsolicited 34 -- not re-reading bounds");
          }
       } else if (!strcmp(uuid, U_DATA)) {
          struct dex_record r[8];
@@ -629,14 +1014,36 @@ void driver_on_notify(const char *uuid, const uint8_t *buf, int n)
             LOGI("     rec ts=%u glu=%d", r[i].timestamp, r[i].glucose);
             /* age = how long ago this record was taken, from the sensor clock
              */
-            long age = last_clock ? (long)last_clock - (long)r[i].timestamp : 0;
-            if (age < 0)
-               age = 0;
+            /* NO SENSOR CLOCK => NO USABLE AGE, so drop the record rather
+             * than fall back to 0. Age 0 means "taken just now", so every
+             * historical record in the batch would be written to the
+             * append-only log dated at the moment it ARRIVED -- a burst of
+             * fabricated readings at the right edge of the plot. last_clock is
+             * only set by a 0x4e, and goto_stream requests one first, so the
+             * benign ordering is normal -- but a post-auth peer controls the
+             * order, and stealo_backfill has no age bound of its own to catch
+             * it (unlike stealo_glucose). */
+            if (!ctx->last_clock) {
+               LOGI("     skipped: no session clock yet");
+               continue;
+            }
+            long age = (long)ctx->last_clock - (long)r[i].timestamp;
+            /* Bound from BOTH ends. A record whose timestamp is 0 (or garbage)
+             * against a mature session clock yields an age of up to the whole
+             * session, which the host turns into a reading dated days in the
+             * past -- written to a log that is never rewritten. Clamping only
+             * at zero caught the negative case and let that one through.
+             * A backfill record older than the sensor's own life is not a
+             * record, so drop it rather than invent a timestamp for it. */
+            if (age < 0 || age > 16L * 86400) {
+               LOGI("     skipped: implausible age %ld s", age);
+               continue;
+            }
             drv_backfill(r[i].glucose, 127,
                          (int)age); /* 127 = trend unavailable */
          }
          if (k > 0) {
-            streamed = 1;
+            ctx->streamed = 1;
             remember_sensor();
          }
       }

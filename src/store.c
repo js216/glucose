@@ -9,8 +9,52 @@
  */
 #include "store.h"
 #include "dexlibc.h"
+#include "sensors.h" /* KIND_CGM / KIND_BGM */
 #include "util.h"
-#include <stdio.h> /* snprintf, SEEK_SET / SEEK_END */
+#include <limits.h> /* LONG_MAX: saturate over-long numeric fields */
+#include <stdio.h>  /* snprintf, SEEK_SET / SEEK_END */
+
+int __android_log_print(int prio, const char *tag, const char *fmt, ...);
+#define LOGW(...) __android_log_print(5, "stealo", __VA_ARGS__)
+
+/* Read one comma-separated integer field and step past its separator. Sets
+ * *present (when given) to whether the field held any digits at all, which is
+ * how an empty rssi column and an absent v1 column are told apart. */
+static long rdfield(char **p, const char *e, int *present)
+{
+   char *q = *p;
+   long v  = 0;
+   int neg = 0;
+   int got = 0;
+   if (q < e && *q == '-') {
+      neg = 1;
+      q++;
+   }
+   /* CAP THE DIGITS. Signed overflow is undefined behaviour, and it happens
+    * here -- during parsing -- before any downstream range check can reject
+    * the value, so the guards in store_load and stat_add cannot save us. This
+    * file is ours, but a corrupted or hand-edited row is exactly what a parser
+    * has to survive. 18 digits cannot overflow a 64-bit long; anything longer
+    * is not a field this schema ever writes, so saturate and let the callers'
+    * range checks discard the row. */
+   int nd = 0;
+   while (q < e && *q >= '0' && *q <= '9') {
+      if (nd < 18) {
+         v = (v * 10) + (*q - '0');
+         nd++;
+      } else {
+         v = LONG_MAX / 2; /* unparseable: guaranteed to fail every bound */
+      }
+      q++;
+      got = 1;
+   }
+   if (q < e && *q == ',')
+      q++;
+   *p = q;
+   if (present)
+      *present = got;
+   return neg ? -v : v;
+}
 
 struct reading g_hist[NHIST];
 int g_nhist;
@@ -20,46 +64,142 @@ int g_cur_rssi, g_cur_rssi_ok;
 int g_stored;
 char g_store_path[256];
 
-int hist_insert(long t, int glu, int trend)
+/* Column header for readings.csv, so an exported log is self-describing. */
+static const char g_store_hdr[] =
+    "# unix_time,glucose_mgdl,trend,rssi,recv_lag_s,sensor_id,"
+    "device_time,tz_offset_s,kind\n";
+
+void hist_refresh_current(int prime)
 {
+   /* Only a CGM sample may become the current reading. g_hist[0] is the newest
+    * across ALL sources, so taking it blindly would let a meter fingerstick
+    * become the big number -- with a trend arrow, and feeding the alarm --
+    * whenever the meter synced more recently than the sensor. See the
+    * invariant in store.h and sensor_set_primary(). */
+   /* `prime` is resolved by the caller under the registry lock, BEFORE it takes
+    * hist_lock -- reading g_slot here would be both unsynchronized and a lock
+    * order inversion. -1 means "no primary", which skips pass 0. */
+   /* Pass 0 takes the primary's newest sample, pass 1 any CGM's. Choosing the
+    * primary is the whole point of the setting: with two sensors running, the
+    * big number and the alarm would otherwise flip between them every few
+    * minutes on whichever happened to report last. Pass 1 is the fallback for
+    * a primary that has not reported yet (or was just forgotten) -- showing a
+    * stale number, or none, would be worse than showing the other sensor. */
+   for (int pass = 0; pass < 2; pass++) {
+      if (pass == 0 && prime < 0)
+         continue;
+      for (int i = 0; i < g_nhist; i++) {
+         if (g_hist[i].kind == KIND_BGM)
+            continue;
+         if (pass == 0 && g_hist[i].src != (unsigned short)prime)
+            continue;
+         g_cur_glu   = g_hist[i].glu;
+         g_cur_trend = g_hist[i].trend;
+         g_cur_time  = g_hist[i].t;
+         return;
+      }
+   }
+}
+
+int hist_insert(long t, int glu, int trend, int src, int kind)
+{
+   /* CGM samples land on a ~5-min grid, so a nearby sample from the SAME
+    * source is a restatement of one fact; a fingerstick is always its own
+    * event and is only ever deduped on an exact timestamp match. */
+   long window = (kind == KIND_BGM) ? 0 : 150;
    for (int i = 0; i < g_nhist; i++) {
+      if (g_hist[i].src != (unsigned short)src)
+         continue;
+      /* Compare KIND too, or the invariant this header states -- that a BGM
+       * fingerstick never dedups against a CGM sample -- is enforced only by
+       * ids happening to be disjoint. They are not disjoint by construction:
+       * id 0 is shared by legacy rows and any unregistered source. Without
+       * this a CGM sample within the window would overwrite a fingerstick's
+       * value in place, leave it flagged BGM, and return HIST_DUP so the CGM
+       * sample was never persisted at all. */
+      if (g_hist[i].kind != (unsigned char)kind)
+         continue;
       long d = t - g_hist[i].t;
       if (d < 0)
          d = -d;
-      if (d < 150) { /* same 5-min sample */
-         g_hist[i].glu   = glu;
-         g_hist[i].trend = trend;
-         return 0;
+      if (d <= window) {
+         /* Do NOT mutate. Callers persist only on a non-zero result, so an
+          * in-place restatement updated memory while the append-only log kept
+          * the original -- the two then disagreed about the same datapoint,
+          * and after a restart the UI and the alarm silently reverted to the
+          * older value. A restatement is either authoritative (and must be
+          * logged) or it is not; treating the first sample as authoritative
+          * keeps memory and disk identical, which is the property that makes
+          * the log trustworthy. */
+         return HIST_DUP;
       }
    }
    if (g_nhist == NHIST && t <= g_hist[NHIST - 1].t)
-      return 0; /* older than all kept */
+      return HIST_OLD; /* genuinely new, but off the end of the display window
+                        */
    if (g_nhist < NHIST)
       g_nhist++;
+   /* Insertion sort keeps g_hist newest-first, which is what makes the merged
+    * multi-sensor history monotonic in memory even though the file stays in
+    * arrival order. Ties break on source id so the order is total and stable
+    * rather than dependent on which BLE thread got there first. */
    int i = g_nhist - 1;
-   while (i > 0 && g_hist[i - 1].t < t) {
+   while (i > 0 &&
+          (g_hist[i - 1].t < t ||
+           (g_hist[i - 1].t == t && g_hist[i - 1].src > (unsigned short)src))) {
       g_hist[i] = g_hist[i - 1];
       i--;
    }
    g_hist[i].t     = t;
-   g_hist[i].glu   = glu;
-   g_hist[i].trend = trend;
-   return 1;
+   g_hist[i].glu   = (short)glu;
+   g_hist[i].trend = (short)trend;
+   g_hist[i].src   = (unsigned short)src;
+   g_hist[i].kind  = (unsigned char)kind;
+   return HIST_NEW;
 }
 
-void store_append(long t, int glu, int trend, int rssi, int has_rssi)
+void store_append(long t, int glu, int trend, int rssi, int has_rssi, int src,
+                  long raw, long tz, int kind)
 {
    int fd = open(g_store_path, O_WRONLY | O_CREAT | O_APPEND, 0600);
    if (fd < 0)
       return;
-   long lag = realtime_s() - t; /* arrival delay from the datapoint timestamp */
-   char line[64];
-   int n = has_rssi ? snprintf(line, sizeof line, "%ld,%d,%d,%d,%ld\n", t, glu,
-                               trend, rssi, lag)
-                    : snprintf(line, sizeof line, "%ld,%d,%d,,%ld\n", t, glu,
-                               trend, lag);
-   n     = clampn(n, sizeof line);
-   if (write(fd, line, n) != n) { /* ignore */
+   /* One-line column header on a brand-new file, so an exported readings.csv is
+    * self-describing. Only ever written when the file is empty (never prepended
+    * to the existing append-only log); both loaders skip leading-'#' lines. */
+   if (lseek(fd, 0, SEEK_END) == 0) {
+      if (write(fd, g_store_hdr, sizeof g_store_hdr - 1) < 0) { /* best effort */
+      }
+   }
+   /* Where this row starts, so a short write can be undone. O_APPEND makes the
+    * write itself atomic against other writers, but not against a full disk:
+    * a partial row leaves no newline, so the NEXT append concatenates onto it
+    * and the pair parses as one row of spliced fields -- a fabricated reading
+    * at a fabricated time, indistinguishable from a real one forever after.
+    * Truncating back is the only way to keep the log parseable. */
+   long lag = realtime_s() - t; /* arrival delay from the datapoint stamp */
+   char line[160];
+   /* The file is an ARRIVAL log, never re-sorted -- that is what keeps it
+    * append-only and crash-safe. Monotonic order is a property of the sorted
+    * in-memory view (see hist_insert), not of the bytes on disk. */
+   int n  = has_rssi
+                ? snprintf(line, sizeof line, "%ld,%d,%d,%d,%ld,%d,%ld,%ld,%d\n",
+                           t, glu, trend, rssi, lag, src, raw, tz, kind)
+                : snprintf(line, sizeof line, "%ld,%d,%d,,%ld,%d,%ld,%ld,%d\n",
+                           t, glu, trend, lag, src, raw, tz, kind);
+   n      = clampn(n, sizeof line);
+   long w = write(fd, line, n);
+   if (w != n) {
+      /* Roll back by exactly what WE wrote, measured from the end as it stands
+       * now -- not to a start offset sampled before the write. With O_APPEND
+       * another writer can append in between, and truncating to the stale
+       * offset would delete that writer's COMPLETE row as well. Same pattern
+       * as sensor_mint. */
+      if (w > 0)
+         ftruncate(fd, lseek(fd, 0, SEEK_END) - w);
+      close(fd);
+      LOGW("store: short write (%ld of %d), row rolled back", w, n);
+      return;
    }
    close(fd);
    g_stored++;
@@ -71,12 +211,22 @@ int store_count(void)
    if (fd < 0)
       return 0;
    char b[4096];
-   long n = 0;
-   int c  = 0;
+   long n            = 0;
+   int c             = 0;
+   int at_line_start = 1;
+   int comment       = 0; /* current line is a leading-'#' header/comment */
    while ((n = read(fd, b, sizeof b)) > 0)
-      for (long i = 0; i < n; i++)
-         if (b[i] == '\n')
-            c++;
+      for (long i = 0; i < n; i++) {
+         if (at_line_start) {
+            comment       = (b[i] == '#');
+            at_line_start = 0;
+         }
+         if (b[i] == '\n') {
+            if (!comment)
+               c++;
+            at_line_start = 1;
+         }
+      }
    close(fd);
    return c;
 }
@@ -87,16 +237,19 @@ void store_load(void)
    if (fd < 0)
       return;
    long sz = lseek(fd, 0, SEEK_END);
-   /* keep ~7 days on screen (2016 rows x ~25 B); read a generous 64 KB tail */
-   long off = sz > 65536 ? sz - 65536 : 0;
+   /* Keep ~7 days on screen. A schema-v2 row is ~46 B (v1 was ~25 B) and two
+    * sensors can be logging at once, so the tail has to be far larger than it
+    * was or history silently vanishes from the plot after a restart. */
+   long off = sz > STORE_TAIL ? sz - STORE_TAIL : 0;
    lseek(fd, off, SEEK_SET);
-   static char buf[65537];
-   long n = read(fd, buf, 65536);
+   static char buf[STORE_TAIL + 1];
+   long n = read(fd, buf, STORE_TAIL);
    close(fd);
    if (n <= 0)
       return;
    buf[n]        = 0;
    char *p       = buf;
+   long now      = realtime_s();
    long best_t   = 0;
    int best_rssi = 0;
    int best_ok   = 0; /* rssi of the newest row */
@@ -107,61 +260,55 @@ void store_load(void)
          p++;
    } /* skip partial line */
    while (*p) {
+      if (*p == '#') { /* header / comment line */
+         while (*p && *p != '\n')
+            p++;
+         if (*p == '\n')
+            p++;
+         continue;
+      }
       char *e = p;
       while (*e && *e != '\n')
          e++;
-      long t   = 0;
-      long glu = 0;
-      long tr  = 0;
-      int neg  = 0;
-      char *q  = p;
-      while (q < e && *q >= '0' && *q <= '9')
-         t = (t * 10) + (*q++ - '0');
-      if (q < e && *q == ',')
-         q++;
-      while (q < e && *q >= '0' && *q <= '9')
-         glu = (glu * 10) + (*q++ - '0');
-      if (q < e && *q == ',')
-         q++;
-      if (q < e && *q == '-') {
-         neg = 1;
-         q++;
-      }
-      while (q < e && *q >= '0' && *q <= '9')
-         tr = (tr * 10) + (*q++ - '0');
-      if (neg)
-         tr = -tr;
-      int rneg    = 0;
-      int rssi    = 0;
-      int rssi_ok = 0; /* trailing rssi field: "-72" or empty */
-      if (q < e && *q == ',') {
-         q++;
-         if (q < e && *q == '-') {
-            rneg = 1;
-            q++;
-         }
-         while (q < e && *q >= '0' && *q <= '9') {
-            rssi    = (rssi * 10) + (*q++ - '0');
-            rssi_ok = 1;
-         }
-         if (rneg)
-            rssi = -rssi;
-      }
-      if (t > 0) {
-         hist_insert(t, (int)glu, (int)tr);
+      char *q = p;
+      /* Fields are read positionally and a missing one yields present = 0, so
+       * v1 rows (5 fields, pre-registry) still load: src and kind fall back to
+       * 0, which is exactly "legacy Stelo, continuous". */
+      int have_rssi = 0;
+      long t        = rdfield(&q, e, 0);
+      long glu      = rdfield(&q, e, 0);
+      long tr       = rdfield(&q, e, 0);
+      long rssi     = rdfield(&q, e, &have_rssi);
+      (void)rdfield(&q, e, 0); /* recv_lag: diagnostics only */
+      long src = rdfield(&q, e, 0);
+      (void)rdfield(&q, e, 0); /* raw_time: kept for later re-conversion */
+      (void)rdfield(&q, e, 0); /* tz_off:   ditto */
+      long kind = rdfield(&q, e, 0);
+      /* Same plausibility bound the live path applies (glucose_plausible in
+       * main.c) and stat_load applies on replay. Without it, rows written
+       * before that gate existed -- a 0 mg/dL warm-up sentinel, or a spliced
+       * row from a pre-rollback partial write -- are re-admitted to g_hist on
+       * every restart, become g_cur_glu, and fire a spurious LOW alarm on a
+       * displayed value of 0. stat_load would meanwhile exclude the same row,
+       * so the plot and the statistics would disagree about one file. */
+      /* Bound the timestamp at BOTH ends, like the glucose above it. Gating
+       * only at zero let any future-dated row -- from a bad meter clock, or a
+       * spliced row from a pre-rollback partial write -- back into g_hist on
+       * every restart of a file that is never rewritten, where it sorts to the
+       * head and pins a phantom point to the right edge of every plot.
+       * stat_add_at already rejects hour > now, so without this the plot and
+       * the statistics disagreed about the same file. */
+      if (t > 0 && t <= now + 3600 && glu >= 20 && glu <= 600) {
+         hist_insert(t, (int)glu, (int)tr, (int)src, (int)kind);
          if (t >= best_t) {
             best_t    = t;
-            best_rssi = rssi;
-            best_ok   = rssi_ok;
+            best_rssi = (int)rssi;
+            best_ok   = have_rssi;
          }
       }
       p = (*e == '\n') ? e + 1 : e;
    }
-   if (g_nhist > 0) {
-      g_cur_glu   = g_hist[0].glu;
-      g_cur_trend = g_hist[0].trend;
-      g_cur_time  = g_hist[0].t;
-   }
+   hist_refresh_current(sensor_primary_id());
    if (best_ok) {
       g_cur_rssi    = best_rssi;
       g_cur_rssi_ok = 1;
