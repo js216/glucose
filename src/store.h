@@ -5,10 +5,23 @@
 #ifndef STEALO_STORE_H
 #define STEALO_STORE_H
 
-#define NHIST 2100 /* master reading history (~7d at 5-min spacing) */
+/* Master reading history. This is the DISPLAY buffer the plot draws from, and
+ * its size is what bounds how far back the longest plot span (7D = 168 h) can
+ * actually be filled. It MUST be a count large enough that a full 7 days of
+ * readings never overflow it -- otherwise the oldest in-window points get
+ * evicted as new ones arrive and the "7D" plot silently shrinks below a week
+ * (the very bug this sizing fixes). 2100 was "7 days at exactly one 5-min CGM
+ * sample" with zero headroom, so any extra density -- a second sensor, meter
+ * fingersticks, reconnect backfill re-reads -- pushed real 7-day data off the
+ * left edge. 5040 = 7 days at one reading every 2 minutes, a ceiling that
+ * covers two concurrent 5-min CGMs plus a meter plus backfill with margin.
+ * Keep UI_PLOT_MAX in ui.c EQUAL to this (the Makefile crosscheck enforces it;
+ * ui.c is decoupled from this header, so a smaller UI cap would re-truncate the
+ * plot even with a large NHIST). */
+#define NHIST 5040
 /* Bytes of readings.csv read back at startup. Sized so NHIST rows of schema v2
- * (~46 B each) still fit with two sensors logging concurrently. */
-#define STORE_TAIL 262144
+ * (~50 B each with the rescale column and two sensors logging) still fit. */
+#define STORE_TAIL 524288
 
 /* One reading in the display history.
  *
@@ -64,8 +77,11 @@ int hist_insert(long t, int glu, int trend, int src, int kind);
  *   epoch,glucose,trend10,rssi,recv_lag,source_id,raw_time,tz_off,kind
  * `raw` is the sensor's own uncorrected time and `tz` the offset assumed when
  * converting it, so a bad conversion stays repairable decades later. */
+/* rescale_pm is the multiplicative factor (permille; 1000 = none) applied to
+ * this row's glucose, recorded in the trailing `rescale` column for provenance.
+ * The `glu` passed is the ALREADY-rescaled value. */
 void store_append(long t, int glu, int trend, int rssi, int has_rssi, int src,
-                  long raw, long tz, int kind);
+                  long raw, long tz, int kind, int rescale_pm);
 /* Recompute g_cur_* from the newest CGM sample in g_hist, preferring source
  * `prime` (the primary sensor's id, or -1 for none). A BGM fingerstick is
  * never eligible. Call with the history lock held after any insert.

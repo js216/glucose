@@ -1001,7 +1001,8 @@ void driver_on_notify(const char *uuid, const uint8_t *buf, int n)
             ctx->cal_pending = 0;
             driver_cal_bounds(); /* so the UI shows the new state */
             /* Tell the shell the OUTCOME so it can clear (accepted) or surface
-             * (rejected) the durably-queued calibration -- never a silent drop. */
+             * (rejected) the durably-queued calibration -- never a silent drop.
+             */
             drv_cal_result(ctx->cal.result);
          } else {
             LOGI("   unsolicited 34 -- not re-reading bounds");

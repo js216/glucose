@@ -237,18 +237,20 @@ void ot_on_notify(const uint8_t *buf, int n)
    }
    int status = buf[5];
    /* 0x09 = "invalid record index" -- an EMPTY or non-existent slot, NOT a dead
-    * meter. It is per-INDEX, so it must be SKIPPED, never fatal: different Verio
-    * firmwares number their records differently (RI_02.02.00 errors on index 0,
-    * RI_01.09.04 errors on index 1 with a highest-index of 3), and aborting on
-    * the first 0x09 wedged such a meter forever -- every sync re-requested the
-    * same bad index, got 0x09, and finished with 0 records, its stored index
-    * never advancing. Treat it like a short/non-glucose frame: ack, step the
-    * index past it, and keep walking to top_index. Because we start the walk at
-    * index 0 (see below), whichever base the meter uses is covered. */
+    * meter. It is per-INDEX, so it must be SKIPPED, never fatal: different
+    * Verio firmwares number their records differently (RI_02.02.00 errors on
+    * index 0, RI_01.09.04 errors on index 1 with a highest-index of 3), and
+    * aborting on the first 0x09 wedged such a meter forever -- every sync
+    * re-requested the same bad index, got 0x09, and finished with 0 records,
+    * its stored index never advancing. Treat it like a short/non-glucose frame:
+    * ack, step the index past it, and keep walking to top_index. Because we
+    * start the walk at index 0 (see below), whichever base the meter uses is
+    * covered. */
    if (status == 0x09 && phase == P_READ) {
       LOGI("meter: record %d invalid (0x09), skipping", want_index);
       send_ack();
-      last_index = want_index; /* permanent: an empty slot never becomes valid */
+      last_index =
+          want_index; /* permanent: an empty slot never becomes valid */
       walked++;
       if (want_index >= top_index || walked >= OT_MAX_WALK) {
          finish();
@@ -332,8 +334,9 @@ void ot_on_notify(const uint8_t *buf, int n)
        * RI_02.02.00 errors (0x09) on index 0 and stores from 1, but RI_01.09.04
        * errors on index 1 with valid records elsewhere -- so a fixed clamp to 1
        * misses a 0-indexed meter's first record. An invalid base index now just
-       * returns 0x09, which the read handler SKIPS (see above) and walks past, so
-       * whichever base the meter uses, the walk lands on its real records. */
+       * returns 0x09, which the read handler SKIPS (see above) and walks past,
+       * so whichever base the meter uses, the walk lands on its real records.
+       */
       if (from < 0)
          from = 0;
       LOGI("meter: importing records %d..%d", from, top_index);

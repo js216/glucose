@@ -141,8 +141,8 @@ int main(void)
       long now = realtime_s();
 
       reset();
-      store_append(now - 600, 120, 1, -70, 1, 7, 0, 0, KIND_CGM);
-      store_append(now - 300, 130, 1, 0, 0, 7, 0, 0, KIND_CGM);
+      store_append(now - 600, 120, 1, -70, 1, 7, 0, 0, KIND_CGM, 1000);
+      store_append(now - 300, 130, 1, 0, 0, 7, 0, 0, KIND_CGM, 1000);
       ck(store_count() == 2, "two appended rows are counted");
 
       reset();
@@ -155,14 +155,14 @@ int main(void)
       /* The bound added after a meter clock wrote a year-2039 row: a
        * future-dated row sorts to the head of the history permanently and is
        * re-admitted on EVERY restart of a file that is never rewritten. */
-      store_append(now + 86400, 150, 1, 0, 0, 7, 0, 0, KIND_CGM);
+      store_append(now + 86400, 150, 1, 0, 0, 7, 0, 0, KIND_CGM, 1000);
       reset();
       store_load();
       ck(g_nhist == 2, "a future-dated row is refused at load");
 
       /* Glucose is bounded symmetrically with the live path. */
-      store_append(now - 100, 5, 1, 0, 0, 7, 0, 0, KIND_CGM);
-      store_append(now - 101, 5000, 1, 0, 0, 7, 0, 0, KIND_CGM);
+      store_append(now - 100, 5, 1, 0, 0, 7, 0, 0, KIND_CGM, 1000);
+      store_append(now - 101, 5000, 1, 0, 0, 7, 0, 0, KIND_CGM, 1000);
       reset();
       store_load();
       ck(g_nhist == 2, "implausible glucose is refused at load");

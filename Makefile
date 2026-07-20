@@ -61,8 +61,8 @@ $(LIB): $(SRC) $(HDR) $(STUBS)
 	    -Wl,--no-undefined -Lbuild/stub -lc -landroid -llog -o $@ $(SRC)
 	$(STRIP) $@
 
-build/classes/com/jk/stealo/Ble.class: src/Ble.java src/StealoService.java src/Alarm.java
-	javac $(JAVACFLAGS) -d build/classes src/Ble.java src/StealoService.java src/Alarm.java
+build/classes/com/jk/stealo/Ble.class: src/Ble.java src/StealoService.java src/Alarm.java src/StealoFiles.java
+	javac $(JAVACFLAGS) -d build/classes src/Ble.java src/StealoService.java src/Alarm.java src/StealoFiles.java
 
 $(DEX): build/classes/com/jk/stealo/Ble.class
 	@mkdir -p $(@D)
@@ -170,26 +170,6 @@ format:
 format-fix:
 	clang-format -i $(FMT_SRC)
 
-# test/ is deliberately NOT in the tidy set, and that is a decision, not an
-# oversight. The blocker is not one or two fixable diagnostics -- it is that
-# TIDY_ARGS is the wrong toolchain for these files:
-#   - TIDY_ARGS says --target=aarch64-linux-android29 -ffreestanding, but the
-#     test programs are HOST binaries that use FILE, fopen, fprintf, perror and
-#     exit. Under those flags none of that resolves, so tidy emits hard
-#     clang-diagnostic-errors before reaching any real check. Tidying test/
-#     would need its own flag set, not an addition to this one.
-#   - On top of that, misc-use-internal-linkage wants main() static (a hosted
-#     entry point cannot be) and wants the __android_log_print stub static,
-#     when that stub exists precisely to satisfy calls from OTHER translation
-#     units (store.c, stats.c) -- verified empirically: making it static fails
-#     the build. Neither is suppressible without editing .clang-tidy, which is
-#     off limits.
-#   - And ~90 further diagnostics fire in the older test files (hicpp-signed-
-#     bitwise x51, readability-isolate-declaration x10, and others).
-# So test/ gets the format, CRLF and non-ASCII checks (see FMT_SRC, which does
-# include it) and the compiler's own -Wall -Wextra -Werror via TESTWARN, but
-# not clang-tidy. Doing it properly is a separate piece of work with a separate
-# flag set; do not expect the two named fixes above to open the door.
 # Constants that must agree ACROSS LANGUAGES. A _Static_assert cannot see Java,
 # so nothing else can catch this: raise LINK_MAX without raising MAX_LINKS and
 # Ble.link(id) returns null for the new link, silently dropping every GATT
@@ -207,7 +187,21 @@ crosscheck:
 	   echo "  every GATT op on a link above $$j would be silently dropped."; \
 	   exit 1; \
 	 fi; \
-	 printf '\033[1;32mcrosscheck\033[0m: LINK_MAX == MAX_LINKS (%s)\n' "$$c"
+	 printf '\033[1;32mcrosscheck\033[0m: LINK_MAX == MAX_LINKS (%s)\n' "$$c"; \
+	 n=$$(grep -oP '#define NHIST\s+\K[0-9]+' src/store.h); \
+	 u=$$(grep -oP '#define UI_PLOT_MAX\s+\K[0-9]+' src/ui.c); \
+	 if [ -z "$$n" ] || [ -z "$$u" ]; then \
+	   echo "crosscheck: could not read NHIST ('$$n') or UI_PLOT_MAX ('$$u')"; \
+	   exit 1; \
+	 fi; \
+	 if [ "$$n" != "$$u" ]; then \
+	   echo "NHIST ($$n in store.h) != UI_PLOT_MAX ($$u in ui.c):"; \
+	   echo "  the shell sends up to NHIST plot points but ui.c draws at most"; \
+	   echo "  UI_PLOT_MAX of them -- a smaller UI cap silently truncates the"; \
+	   echo "  oldest in-window points, shrinking the 7D plot below a week."; \
+	   exit 1; \
+	 fi; \
+	 printf '\033[1;32mcrosscheck\033[0m: NHIST == UI_PLOT_MAX (%s)\n' "$$n"
 
 # A STOPGAP, and labelled as one. There is no Java test binary -- Ble, Alarm and
 # StealoService are almost entirely Android API calls, so exercising them needs
@@ -239,8 +233,24 @@ javacheck:
 	     exit 1; }; \
 	 printf '\033[1;32mjavacheck\033[0m: load-bearing Java lines present\n'
 
+# src/ is tidied with the real freestanding cross-compile flags. test/ is tidied
+# too -- it is the behavioural gate and must not rot -- but as HOST binaries it
+# needs its own flag set (glibc FILE/fopen/exit, host target, the drivertest
+# macro), not TIDY_ARGS. test/.clang-tidy inherits the root config and turns off
+# only the checks that are wrong for a hosted harness (see that file); everything
+# else is enforced identically to src/.
+# Project headers come in via -iquote (so "" includes resolve to src/) and NOT
+# -Isrc: src/ ships freestanding stubs named stdio.h/stdlib.h/string.h, and -Isrc
+# would put those on the <> path, hiding glibc's real FILE/fopen from the host
+# harness (implicit-decl errors). -iquote never affects <> includes, so <stdio.h>
+# stays glibc's -- exactly as the test build (JVM_INC, not JNI_INC) does it.
+TEST_SRC   := $(wildcard test/*.c)
+TIDY_TEST  := -iquote src -iquote test -I/usr/lib/jvm/default-java/include \
+              -I/usr/lib/jvm/default-java/include/linux -DDEXDRIVER_TEST \
+              -Wall -Wextra
 tidy:
 	clang-tidy $(SRC) -- $(TIDY_ARGS)
+	clang-tidy $(TEST_SRC) -- $(TIDY_TEST)
 
 done:
 	@printf '\033[1;32mSUCCESS\033[0m: all checks passed.\n'

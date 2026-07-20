@@ -54,9 +54,9 @@ static void u256_from_be(struct u256 *r, const uint8_t b[32])
    for (int i = 0; i < 4; i++) {
       const uint8_t *p = b + ((size_t)(3 - i) * 8);
       r->v[i]          = ((uint64_t)p[0] << 56U) | ((uint64_t)p[1] << 48U) |
-                ((uint64_t)p[2] << 40U) | ((uint64_t)p[3] << 32U) |
-                ((uint64_t)p[4] << 24U) | ((uint64_t)p[5] << 16U) |
-                ((uint64_t)p[6] << 8U) | (uint64_t)p[7];
+                         ((uint64_t)p[2] << 40U) | ((uint64_t)p[3] << 32U) |
+                         ((uint64_t)p[4] << 24U) | ((uint64_t)p[5] << 16U) |
+                         ((uint64_t)p[6] << 8U) | (uint64_t)p[7];
    }
 }
 

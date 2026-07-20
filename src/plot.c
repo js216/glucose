@@ -46,56 +46,54 @@ static void mark(uint32_t *fb, int stride, int fbw, int fbh, int cx, int cy,
     * 5 square-filled, 6 triangle-filled, 7 circle, 8 circle-filled. (4 = HIDE
     * never reaches here.) */
    switch (shape) {
-   case 1: /* cross */
-      for (int d = -r; d <= r; d++) {
-         putc_clipped(fb, stride, fbw, fbh, cx + d, cy + d, c);
-         putc_clipped(fb, stride, fbw, fbh, cx + d, cy - d, c);
-      }
-      return;
-   case 2: /* open square */
-      for (int d = -r; d <= r; d++) {
-         putc_clipped(fb, stride, fbw, fbh, cx + d, cy - r, c);
-         putc_clipped(fb, stride, fbw, fbh, cx + d, cy + r, c);
-         putc_clipped(fb, stride, fbw, fbh, cx - r, cy + d, c);
-         putc_clipped(fb, stride, fbw, fbh, cx + r, cy + d, c);
-      }
-      return;
-   case 5: /* filled square */
-      for (int dy = -r; dy <= r; dy++)
+      case 1: /* cross */
+         for (int d = -r; d <= r; d++) {
+            putc_clipped(fb, stride, fbw, fbh, cx + d, cy + d, c);
+            putc_clipped(fb, stride, fbw, fbh, cx + d, cy - d, c);
+         }
+         return;
+      case 2: /* open square */
+         for (int d = -r; d <= r; d++) {
+            putc_clipped(fb, stride, fbw, fbh, cx + d, cy - r, c);
+            putc_clipped(fb, stride, fbw, fbh, cx + d, cy + r, c);
+            putc_clipped(fb, stride, fbw, fbh, cx - r, cy + d, c);
+            putc_clipped(fb, stride, fbw, fbh, cx + r, cy + d, c);
+         }
+         return;
+      case 5: /* filled square */
+         for (int dy = -r; dy <= r; dy++)
+            for (int dx = -r; dx <= r; dx++)
+               putc_clipped(fb, stride, fbw, fbh, cx + dx, cy + dy, c);
+         return;
+      case 3: /* open triangle */
+         for (int dy = -r; dy <= r; dy++) {
+            int half = (dy + r) / 2;
+            putc_clipped(fb, stride, fbw, fbh, cx - half, cy + dy, c);
+            putc_clipped(fb, stride, fbw, fbh, cx + half, cy + dy, c);
+         }
          for (int dx = -r; dx <= r; dx++)
-            putc_clipped(fb, stride, fbw, fbh, cx + dx, cy + dy, c);
-      return;
-   case 3: /* open triangle */
-      for (int dy = -r; dy <= r; dy++) {
-         int half = (dy + r) / 2;
-         putc_clipped(fb, stride, fbw, fbh, cx - half, cy + dy, c);
-         putc_clipped(fb, stride, fbw, fbh, cx + half, cy + dy, c);
-      }
-      for (int dx = -r; dx <= r; dx++)
-         putc_clipped(fb, stride, fbw, fbh, cx + dx, cy + r, c);
-      return;
-   case 6: /* filled triangle */
-      for (int dy = -r; dy <= r; dy++) {
-         int half = (dy + r) / 2;
-         for (int dx = -half; dx <= half; dx++)
-            putc_clipped(fb, stride, fbw, fbh, cx + dx, cy + dy, c);
-      }
-      return;
-   case 7:   /* open circle */
-   case 8: { /* filled circle */
-      int r2    = r * r;
-      int inner = (r - 1) * (r - 1);
-      for (int dy = -r; dy <= r; dy++)
-         for (int dx = -r; dx <= r; dx++) {
-            int d2 = (dx * dx) + (dy * dy);
-            if (d2 <= r2 && (shape == 8 || d2 > inner))
+            putc_clipped(fb, stride, fbw, fbh, cx + dx, cy + r, c);
+         return;
+      case 6: /* filled triangle */
+         for (int dy = -r; dy <= r; dy++) {
+            int half = (dy + r) / 2;
+            for (int dx = -half; dx <= half; dx++)
                putc_clipped(fb, stride, fbw, fbh, cx + dx, cy + dy, c);
          }
-      return;
-   }
-   default: /* dot (0) */
-      dot(fb, stride, fbw, fbh, cx, cy, r, c);
-      return;
+         return;
+      case 7:   /* open circle */
+      case 8: { /* filled circle */
+         int r2    = r * r;
+         int inner = (r - 1) * (r - 1);
+         for (int dy = -r; dy <= r; dy++)
+            for (int dx = -r; dx <= r; dx++) {
+               int d2 = (dx * dx) + (dy * dy);
+               if (d2 <= r2 && (shape == 8 || d2 > inner))
+                  putc_clipped(fb, stride, fbw, fbh, cx + dx, cy + dy, c);
+            }
+         return;
+      }
+      default: /* dot (0) */ dot(fb, stride, fbw, fbh, cx, cy, r, c); return;
    }
 }
 
@@ -148,9 +146,9 @@ static int t_to_x(long dt, int x, int w, long span)
 {
    if (dt < 0)
       dt = 0;
-   /* Pad the RIGHT edge only (t_margin), so the newest point isn't half-clipped;
-    * the LEFT edge runs flush to the frame so an extra (older) datapoint can show
-    * there. Hence a single t_margin in usable, not two. */
+   /* Pad the RIGHT edge only (t_margin), so the newest point isn't
+    * half-clipped; the LEFT edge runs flush to the frame so an extra (older)
+    * datapoint can show there. Hence a single t_margin in usable, not two. */
    int usable = w - 3 - t_margin;
    if (usable < 1)
       usable = 1;

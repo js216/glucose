@@ -44,5 +44,10 @@
     <service android:name=".StealoService"
              android:foregroundServiceType="connectedDevice"
              android:exported="false"/>
+    <!-- serves the exported CSVs as content:// URIs for the EXPORT DATA share -->
+    <provider android:name=".StealoFiles"
+              android:authorities="com.jk.stealo.files"
+              android:exported="false"
+              android:grantUriPermissions="true"/>
   </application>
 </manifest>

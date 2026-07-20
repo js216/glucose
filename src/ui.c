@@ -297,21 +297,25 @@ void fmt_dur(long seconds, char *out, int n)
  * rendered blue, etc. Encoded correctly (R and B swapped) they now match their
  * names. */
 static const uint32_t ui_sensor_colors[7] = {
-    0xFF88FF33 /* GREEN */, 0xFFFFAA44 /* BLUE */,  0xFF44CCFF /* AMBER */,
-    0xFFAA66FF /* PINK */,  0xFFEEFF66 /* CYAN */,  0xFFFF88BB /* VIOLET */,
+    0xFF88FF33 /* GREEN */,
+    0xFFFFAA44 /* BLUE */,
+    0xFF44CCFF /* AMBER */,
+    0xFFAA66FF /* PINK */,
+    0xFFEEFF66 /* CYAN */,
+    0xFFFF88BB /* VIOLET */,
     0xFFFFFFFF /* WHITE -- the default primary-trace colour */};
-static const char *const ui_color_names[7] = {"GREEN", "BLUE",   "AMBER", "PINK",
-                                               "CYAN",  "VIOLET", "WHITE"};
+static const char *const ui_color_names[7] = {
+    "GREEN", "BLUE", "AMBER", "PINK", "CYAN", "VIOLET", "WHITE"};
 /* Indexed by the (frozen) enum value. */
 static const char *const ui_marker_names[MARK_N] = {
-    "DOT",         "CROSS",  "SQUARE",        "TRIANGLE", "HIDE",
-    "SQUARE FILL", "TRI FILL", "CIRCLE",      "CIRC FILL"};
+    "DOT",         "CROSS",    "SQUARE", "TRIANGLE", "HIDE",
+    "SQUARE FILL", "TRI FILL", "CIRCLE", "CIRC FILL"};
 /* Order the MARKER picker lists shapes in (grouped filled/empty, HIDE last).
  * DOT is omitted -- it renders identically to SQUARE FILL. */
 #define UI_NMARKERS 8
 static const int ui_marker_order[UI_NMARKERS] = {
-    MARK_CIRCLE,     MARK_CIRCLE_F, MARK_SQUARE, MARK_SQUARE_F,
-    MARK_TRIANGLE,   MARK_TRIANGLE_F, MARK_CROSS, MARK_HIDE};
+    MARK_CIRCLE,   MARK_CIRCLE_F,   MARK_SQUARE, MARK_SQUARE_F,
+    MARK_TRIANGLE, MARK_TRIANGLE_F, MARK_CROSS,  MARK_HIDE};
 
 uint32_t ui_sensor_color(int color)
 {
@@ -340,14 +344,10 @@ const char *ui_marker_name(int marker)
 static const char *sensor_disp_name(int type)
 {
    switch (type) {
-   case SENSOR_STELO:
-      return "DEXCOM STELO";
-   case SENSOR_G7:
-      return "DEXCOM G7";
-   case SENSOR_ONETOUCH:
-      return "ONETOUCH VERIO";
-   default:
-      return sensor_type_name(type);
+      case SENSOR_STELO: return "DEXCOM STELO";
+      case SENSOR_G7: return "DEXCOM G7";
+      case SENSOR_ONETOUCH: return "ONETOUCH VERIO";
+      default: return sensor_type_name(type);
    }
 }
 
@@ -474,10 +474,10 @@ static int render_glucose(struct ANativeWindow_Buffer *fb,
    int colx  = bx + big_w + gap;
    int gh    = 7 * sc;    /* a label glyph is 7 rows tall */
    int num_h = 7 * bigsc; /* the big number's exact glyph height */
-   /* Three values, tightly stacked and BOTTOM-aligned so the age's bottom row is
-    * exactly the big number's bottom row. */
-   int vlh   = gh + (2 * sc);   /* tight line pitch */
-   int age_y = y + num_h - gh;  /* age bottom == number bottom */
+   /* Three values, tightly stacked and BOTTOM-aligned so the age's bottom row
+    * is exactly the big number's bottom row. */
+   int vlh   = gh + (2 * sc);  /* tight line pitch */
+   int age_y = y + num_h - gh; /* age bottom == number bottom */
    draw_str(px, fb, colx, age_y - (2 * vlh), sc, UI_LBL(m->units), 0xFFCCCCCC);
    draw_str(px, fb, colx, age_y - vlh, sc, tr, 0xFFCCCCCC);
    draw_str(px, fb, colx, age_y, sc, agestr, 0xFFCCCCCC);
@@ -485,13 +485,13 @@ static int render_glucose(struct ANativeWindow_Buffer *fb,
     * space above the three values. Its hit box is the ONLY way to open settings
     * now (the whole-top-band target is gone), so pad it out well past the glyph
     * so the surrounding space is pressable too. */
-   int ham_w   = 9 * sc;
-   int ham_bh  = 2 * sc; /* bar thickness */
-   int ham_gp  = 2 * sc; /* gap between bars */
-   int ham_h   = (3 * ham_bh) + (2 * ham_gp);
-   int sp_top  = y;                       /* top of the empty space */
-   int sp_bot  = age_y - (2 * vlh) - gap; /* just above the first value */
-   int ham_y   = sp_top + (((sp_bot - sp_top) - ham_h) / 2); /* v-centre */
+   int ham_w  = 9 * sc;
+   int ham_bh = 2 * sc; /* bar thickness */
+   int ham_gp = 2 * sc; /* gap between bars */
+   int ham_h  = (3 * ham_bh) + (2 * ham_gp);
+   int sp_top = y;                       /* top of the empty space */
+   int sp_bot = age_y - (2 * vlh) - gap; /* just above the first value */
+   int ham_y  = sp_top + (((sp_bot - sp_top) - ham_h) / 2); /* v-centre */
    if (ham_y < sp_top)
       ham_y = sp_top;
    int ham_x = colx + ((col_w - ham_w) / 2); /* h-centre in the column */
@@ -582,8 +582,13 @@ static int render_glucose(struct ANativeWindow_Buffer *fb,
    int plot_x = cx + (2 * sc);
    int plot_y = y;
    int plot_w = cw - (4 * sc);
-   /* ~7 days of readings at 5-minute spacing; the shell never sends more. */
-#define UI_PLOT_MAX 2100
+   /* Must EQUAL store.h's NHIST: the shell sends up to NHIST points, and this
+    * static cap clamps how many the plot draws. If it were smaller, the plot
+    * would truncate the oldest in-window points even when the shell holds a
+    * full 7 days -- the same shrinking-7D bug NHIST's sizing fixes. ui.c is
+    * intentionally decoupled from store.h, so the Makefile `crosscheck` target
+    * greps both and fails the build if they ever drift apart. */
+#define UI_PLOT_MAX 5040
    static struct plot_pt pts[UI_PLOT_MAX];
    int np = m->nhist < UI_PLOT_MAX ? m->nhist : UI_PLOT_MAX;
    for (int i = 0; i < np; i++) {
@@ -604,9 +609,9 @@ static int render_glucose(struct ANativeWindow_Buffer *fb,
       for (int k = 0; k < m->nsensors; k++) {
          /* Pre-registry legacy CGM readings (src 0) are this user's own earlier
           * data from before the registry existed -- one CGM behind all of it --
-          * so attribute them to the PRIMARY sensor at DISPLAY time. That colours
-          * the whole trace consistently (not just post-migration points) without
-          * rewriting the append-only readings log. */
+          * so attribute them to the PRIMARY sensor at DISPLAY time. That
+          * colours the whole trace consistently (not just post-migration
+          * points) without rewriting the append-only readings log. */
          int primary_legacy = (m->hist[i].src == 0 && m->sensors[k].primary &&
                                m->hist[i].kind != KIND_BGM);
          if (m->sensors[k].id == m->hist[i].src || primary_legacy) {
@@ -614,7 +619,7 @@ static int render_glucose(struct ANativeWindow_Buffer *fb,
             pts[i].col    = ui_sensor_color(m->sensors[k].color);
             pts[i].marker = m->sensors[k].marker; /* shape applies to ALL,
                                                      including the primary */
-            pts[i].size   = m->sensors[k].size;
+            pts[i].size = m->sensors[k].size;
             /* HIDE: drop this device's point entirely. */
             if (m->sensors[k].marker == MARK_HIDE)
                pts[i].hidden = 1;
@@ -705,18 +710,20 @@ static void render_info(struct ANativeWindow_Buffer *fb, const struct screen *m,
     * up to 6, and a glyph is 6*sc wide -- so 40*6 = 240 units of sc, which is
     * wider than UI_COLS implies and was clipping "MG/DL" off the right edge. */
    int expired = (m->have_reading && m->session_seconds >= 15L * 86400);
-   /* Fit to the space left below the plot in BOTH axes -- the downscale is kept,
-    * because it is what makes this block fit on smaller screens. The bug was not
-    * the downscale, it was OVER-BUDGETING the width: `wide` reserved 53 chars for
-    * the worst-case unbonded STATE line, so on a normal phone the whole block was
-    * shrunk a step below the rest of the UI to reserve room no real row uses.
+   /* Fit to the space left below the plot in BOTH axes -- the downscale is
+    * kept, because it is what makes this block fit on smaller screens. The bug
+    * was not the downscale, it was OVER-BUDGETING the width: `wide` reserved 53
+    * chars for the worst-case unbonded STATE line, so on a normal phone the
+    * whole block was shrunk a step below the rest of the UI to reserve room no
+    * real row uses.
     *
     * The genuine fixed-width content is the stats table: 4+5*5 columns plus a
-    * units label of up to 6 = 35. Budget THAT. The one variable-width row (STATE)
-    * is instead truncated to the column, so it can never widen the budget. On a
-    * normal-width phone this yields the same `sc` as everywhere else; on a narrow
-    * or split-screen window it still steps down gracefully. */
-   int needv  = (4 * 16) + 7 + (4 * 16) + (7 + 9) + (7 * 5);
+    * units label of up to 6 = 35. Budget THAT. The one variable-width row
+    * (STATE) is instead truncated to the column, so it can never widen the
+    * budget. On a normal-width phone this yields the same `sc` as everywhere
+    * else; on a narrow or split-screen window it still steps down gracefully.
+    */
+   int needv = (4 * 16) + 7 + (4 * 16) + (7 + 9) + (7 * 5);
    if (expired)
       needv += (2 * 16) + 16 + 10;
    int availv = fb->height - y;
@@ -740,19 +747,27 @@ static void render_info(struct ANativeWindow_Buffer *fb, const struct screen *m,
    if (m->bonded) {
       (void)snprintf(row, sizeof row, "STATE   CONNECTED");
    } else {
-      /* TRUNCATE the status to what fits this column at the normal font, rather
-       * than shrinking the whole block to fit the longest possible status. */
-      int fit    = (sc > 0) ? cw / (6 * sc) : UI_COLS; /* glyph columns */
-      int budget = fit - 18;                           /* "STATE   " + " N ADV" */
-      if (budget < 4)
-         budget = 4;
+      /* TRUNCATE the status so the ENTIRE row fits the column at the normal
+       * font -- rather than shrinking the whole block to the widest possible
+       * status. The overhead is measured EXACTLY ("STATE   " + "  " + the
+       * actual advert-count digits + " ADV"), so the row can never overflow and
+       * clip. */
+      char advs[16];
+      (void)snprintf(advs, sizeof advs, "%u", m->adv_total);
+      /* Columns that fit from x (= cx + 2*sc) to the right edge -- NOT the full
+       * cw, or the 2*sc left margin makes the row overrun and clip. */
+      int fit      = (sc > 0) ? (cw - (4 * sc)) / (6 * sc) : UI_COLS;
+      int overhead = 8 + 2 + str_len(advs) + 4; /* "STATE   " + "  N ADV" */
+      int budget   = fit - overhead;
+      if (budget < 0)
+         budget = 0;
       if (budget > UI_COLS)
          budget = UI_COLS;
       char st[UI_COLS + 1];
       str_snapshot(st, sizeof st, m->status ? m->status : "");
       if (str_len(st) > budget)
          st[budget] = '\0';
-      (void)snprintf(row, sizeof row, "STATE   %s  %u ADV", st, m->adv_total);
+      (void)snprintf(row, sizeof row, "STATE   %s  %s ADV", st, advs);
    }
    draw_str(px, fb, x, y, sc, row, col);
    y += lh;
@@ -789,8 +804,9 @@ static void render_info(struct ANativeWindow_Buffer *fb, const struct screen *m,
    }
    draw_str(px, fb, x, y, sc, row, col);
    y += lh;
-   /* The STATE..PRED block describes the PRIMARY CGM, so a tap anywhere in it is
-    * a shortcut straight to that device's menu (via ACT_MENU -> MA_SENSOR). */
+   /* The STATE..PRED block describes the PRIMARY CGM, so a tap anywhere in it
+    * is a shortcut straight to that device's menu (via ACT_MENU -> MA_SENSOR).
+    */
    for (int k = 0; k < m->nsensors; k++)
       if (m->sensors[k].primary && m->sensors[k].kind == KIND_CGM) {
          add_hit(h, cx, info_y0, cw, y - info_y0, ACT_MENU, MA_SENSOR + k);
@@ -951,12 +967,15 @@ static void render_main(struct ANativeWindow_Buffer *fb, const struct screen *m,
     * was laid out past the edge and silently dropped by draw_cell. That is
     * reachable on 16:9 phones and on every split-screen window, and the banner
     * is the explicit on-screen indication that the user is out of range. */
-   /* 466, not 340: render_glucose needs ~278 units of sc (big number, trend
-    * rows, plot, alarm row) and render_info another ~186 (four info rows, the
-    * stats table, the banner). Budgeting only 340 left no scale at which the
-    * pair fits, and render_info then rendered ANYWAY -- pushing the
-    * out-of-range banner off the bottom on narrow short windows. */
-   int mvsc = (fb->height - (fb->height / 20)) / 466;
+   /* Vertical budget, in units of sc. In PORTRAIT the glucose block (~278) and
+    * the info block (~186) are STACKED, so both must fit the height: ~466. In
+    * LANDSCAPE they are SIDE BY SIDE, independent columns -- the plot flexes,
+    * so the binding column is the info block (~186) plus margin. Using 466
+    * there halved the scale, leaving everything tiny with the right half mostly
+    * empty.
+    */
+   int budget = landscape ? 210 : 466;
+   int mvsc   = (fb->height - (fb->height / 20)) / budget;
    if (mvsc < 1)
       mvsc = 1;
    if (mvsc < sc)
@@ -1087,8 +1106,8 @@ static void render_settings(struct ANativeWindow_Buffer *fb,
    menu_row(fb, h, y, sc, lh, "DISCONNECT", ui_disc_lbl[(unsigned)m->disc & 3U],
             0xFFFFFFFF, MA_DISC);
    y += lh;
-   menu_row(fb, h, y, sc, lh, "NEW DATAPOINT",
-            m->newdata_beep ? "BEEP" : "OFF", 0xFFFFFFFF, MA_NEWDATA);
+   menu_row(fb, h, y, sc, lh, "NEW DATAPOINT", m->newdata_beep ? "BEEP" : "OFF",
+            0xFFFFFFFF, MA_NEWDATA);
    y += 2 * lh;
 
    /* permissions + the background controls a CGM needs alive. Values are the
@@ -1136,19 +1155,19 @@ static void render_settings(struct ANativeWindow_Buffer *fb,
       char val[28]; /* status[12] + ' ' + ago[12], with room to spare */
       char ago[12];
       /* For a meter the age is its last SYNC, never its last fingerstick -- so
-       * "SYNCED 2 M" means synced 2 min ago, not a datapoint 2 min old. The sync
-       * time is persisted, so it survives a restart; if a meter has genuinely
-       * never synced it reads NEVER rather than mislabelling a datapoint age. */
+       * "SYNCED 2 M" means synced 2 min ago, not a datapoint 2 min old. The
+       * sync time is persisted, so it survives a restart; if a meter has
+       * genuinely never synced it reads NEVER rather than mislabelling a
+       * datapoint age. */
       long agot = (s->kind == KIND_BGM) ? s->meter_sync_t : s->last;
       fmt_ago(m->now, agot, ago, sizeof ago);
       (void)snprintf(val, sizeof val, "%s %s", s->status, ago);
       /* '>' marks the primary -- the sensor that owns the big number. It goes
        * in the label rather than left of the row, where it overlapped. */
-      /* 18, not 16: this holds the primary marker (1) plus a full 15-character
-       * label plus the terminator. At 16 the last character of a maximum-length
-       * name was dropped -- the same one-character truncation class ui.h
-       * documents as fixed for the label itself. */
-      char name[18];
+      /* Holds the primary marker (1) plus a full label (sizeof s->label, which
+       * grew to 20 for the long OneTouch default names) plus the terminator.
+       * Undersizing it truncated the MAC tail that tells two meters apart. */
+      char name[1 + sizeof s->label];
       (void)snprintf(name, sizeof name, "%s%s", s->primary ? ">" : " ",
                      s->label);
       menu_row(fb, h, y, sc, lh, name, val,
@@ -1166,9 +1185,17 @@ static void render_settings(struct ANativeWindow_Buffer *fb,
       draw_str(px, fb, x, y, sc, more, 0xFF4466FF);
       y += lh;
    }
-   if (m->nsensors < UI_MAX_SLOTS)
-      menu_row(fb, h, y, sc, lh, "ADD NEW DEVICE ...", "", 0xFFFFFFFF,
-               MA_ADDSENSOR);
+   int bw = fb->width - (2 * x);
+   if (m->nsensors < UI_MAX_SLOTS) {
+      /* A real framed button, like SYNC NOW / FORGET DEVICE, not a plain row.
+       */
+      y += lh; /* separate it from the device list above */
+      y = menu_button(fb, h, x, y, bw, sc, "ADD NEW DEVICE", 0xFFFFFFFF,
+                      MA_ADDSENSOR);
+   }
+   /* EXPORT DATA: build the combined CSV and open the system share sheet. */
+   y += lh;
+   menu_button(fb, h, x, y, bw, sc, "EXPORT DATA", 0xFFFFFFFF, MA_EXPORT);
 }
 
 /* ---- per-sensor screen: attributes above, actions below ---- */
@@ -1211,7 +1238,8 @@ static void render_sensor(struct ANativeWindow_Buffer *fb,
    y += 2 * lh;
 
    /* Identity: type + name (+ PRIMARY for a CGM), no section title. */
-   menu_row(fb, h, y, sc, lh, "TYPE", sensor_disp_name(s->type), 0xFFFFFFFF, -1);
+   menu_row(fb, h, y, sc, lh, "TYPE", sensor_disp_name(s->type), 0xFFFFFFFF,
+            -1);
    y += lh;
    menu_row(fb, h, y, sc, lh, "NAME", s->label, 0xFFFFFFFF, MA_LABEL);
    y += lh;
@@ -1256,33 +1284,42 @@ static void render_sensor(struct ANativeWindow_Buffer *fb,
       menu_row(fb, h, y, sc, lh, "SIGNAL STRENGTH", rs, 0xFFFFFFFF, -1);
       y += lh;
    }
-   if (s->kind == KIND_BGM) {
-      /* A meter is off between syncs. Two DISTINCT times: LAST SYNC is when the
-       * app last connected it; LAST DATA is its most recent fingerstick. */
+   {
+      /* LAST SEEN: the most recent time we heard from this device -- a meter's
+       * last connect/sync, a CGM's last reading. Directly under SIGNAL
+       * STRENGTH, whose value is the signal captured at that same moment. */
       char when[20];
       char rel[12];
-      char val[36];
-      if (s->meter_sync_t > 0) {
-         fmt_date(s->meter_sync_t, m->tz_off, when, sizeof when);
-         fmt_ago(m->now, s->meter_sync_t, rel, sizeof rel);
+      char val[48]; /* "<date up to 19> (<rel up to 11> AGO)" + NUL */
+      long seen = (s->kind == KIND_BGM) ? s->meter_sync_t : s->last;
+      if (seen > 0) {
+         fmt_date(seen, m->tz_off, when, sizeof when);
+         fmt_ago(m->now, seen, rel, sizeof rel);
          (void)snprintf(val, sizeof val, "%s (%s AGO)", when, rel);
       } else {
          (void)snprintf(val, sizeof val, "--");
       }
-      menu_row(fb, h, y, sc, lh, "LAST SYNC", val, 0xFFFFFFFF, -1);
+      menu_row(fb, h, y, sc, lh, "LAST SEEN", val, 0xFFFFFFFF, -1);
       y += lh;
-      if (s->last > 0) {
-         fmt_date(s->last, m->tz_off, when, sizeof when);
-         fmt_ago(m->now, s->last, rel, sizeof rel);
-         (void)snprintf(val, sizeof val, "%s (%s AGO)", when, rel);
-      } else {
-         (void)snprintf(val, sizeof val, "--");
+      /* A meter's fingerstick time is DISTINCT from its sync, so it keeps a
+       * separate LAST DATA row; a CGM's LAST SEEN already IS its data time. */
+      if (s->kind == KIND_BGM) {
+         if (s->last > 0) {
+            fmt_date(s->last, m->tz_off, when, sizeof when);
+            fmt_ago(m->now, s->last, rel, sizeof rel);
+            (void)snprintf(val, sizeof val, "%s (%s AGO)", when, rel);
+         } else {
+            (void)snprintf(val, sizeof val, "--");
+         }
+         menu_row(fb, h, y, sc, lh, "LAST DATA", val, 0xFFFFFFFF, -1);
+         y += lh;
       }
-      menu_row(fb, h, y, sc, lh, "LAST DATA", val, 0xFFFFFFFF, -1);
-      y += lh;
    }
    if (s->kind == KIND_CGM) {
-      char b[16];
+      /* Holds "<value> <unit>" for the PRED row: fmt_glu into a 12-byte buffer
+       * (up to 11 chars, as the compiler sees it) + ' ' + a 6-char unit + NUL.
+       */
+      char b[24];
       /* Only show session timing once a real session is known. Before the first
        * reading session_seconds is 0, which otherwise renders as "started 0s
        * ago, ends in 15 days" -- misleading, so show "--" instead. */
@@ -1322,7 +1359,7 @@ static void render_sensor(struct ANativeWindow_Buffer *fb,
       /* REMAINING: relative time to session end, replacing the old ENDS
        * parenthetical. EXPIRED (red) once the session length is exceeded. */
       if (len > 0) {
-         long ends = began + len;
+         long ends     = began + len;
          uint32_t rcol = 0xFFFFFFFF;
          if (!have_session) {
             (void)snprintf(val, sizeof val, "--");
@@ -1368,6 +1405,35 @@ static void render_sensor(struct ANativeWindow_Buffer *fb,
       menu_row(fb, h, y, sc, lh, "FW", s->fw, 0xFFFFFFFF, -1);
       y += lh;
    }
+   /* RESCALE: the active multiplicative correction as a signed percentage, or
+    * (NONE). Tapping opens the value keypad, or -- if already active -- the
+    * CHANGE / STOP screen. Sits just above LAST CAL. */
+   if (s->kind == KIND_CGM) {
+      char rv[32]; /* "PENDING " + value(<=11) + ' ' + unit(<=6) + NUL */
+      uint32_t rcol = 0xFFFFFFFF;
+      if (s->rescale_pending > 0) {
+         char gv[12];
+         fmt_glu(s->rescale_pending, m->units, gv, sizeof gv);
+         (void)snprintf(rv, sizeof rv, "PENDING %s %s", gv, UI_LBL(m->units));
+         rcol = 0xFF44CCFF;
+      } else if (s->rescale_rejected) {
+         (void)snprintf(rv, sizeof rv, "REJECTED >25%%");
+         rcol = 0xFF4466FF; /* red */
+      } else if (s->rescale_expired) {
+         (void)snprintf(rv, sizeof rv, "EXPIRED - RE-ENTER");
+         rcol = 0xFF4466FF; /* red */
+      } else if (s->rescale_pm != 1000) {
+         int d = s->rescale_pm - 1000; /* tenths of a percent */
+         int a = (d < 0) ? -d : d;
+         (void)snprintf(rv, sizeof rv, "%c%d.%d%%", (d < 0) ? '-' : '+', a / 10,
+                        a % 10);
+         rcol = 0xFF44CCFF; /* amber: active */
+      } else {
+         (void)snprintf(rv, sizeof rv, "(NONE)");
+      }
+      menu_row(fb, h, y, sc, lh, "RESCALE", rv, rcol, MA_RESCALE_OPEN);
+      y += lh;
+   }
    /* LAST CAL: sits right above the CALIBRATION button so the outcome of the
     * last calibration is next to where you start a new one. Shows (NONE), a
     * PENDING queue entry, or the resolved outcome -- the accepted mg/dL value,
@@ -1383,19 +1449,26 @@ static void render_sensor(struct ANativeWindow_Buffer *fb,
       } else if (s->cal_t > 0) {
          char cd[20];
          fmt_date(s->cal_t, m->tz_off, cd, sizeof cd);
-         if (s->cal_ok) {
+         if (s->cal_state == CAL_ST_APPLIED) {
             fmt_glu(s->cal_mgdl, m->units, gv, sizeof gv);
             (void)snprintf(cv, sizeof cv, "%s %s %s", cd, gv, UI_LBL(m->units));
             ccol = 0xFF88FF33; /* green: accepted */
          } else {
-            (void)snprintf(cv, sizeof cv, "%s FAIL", cd);
-            ccol = 0xFF4466FF; /* red: failed */
+            /* Distinct failure kinds so REJECTED (bad value) is not confused
+             * with NOT SUPPORTED (sensor forbids calibration). */
+            const char *w = "FAILED";
+            if (s->cal_state == CAL_ST_REJECTED)
+               w = "REJECTED";
+            else if (s->cal_state == CAL_ST_NOTSUP)
+               w = "NOT SUPPORTED";
+            (void)snprintf(cv, sizeof cv, "%s %s", cd, w);
+            ccol = 0xFF4466FF; /* red */
          }
       } else {
          (void)snprintf(cv, sizeof cv, "(NONE)");
       }
-      /* While a calibration is queued, the row itself is a shortcut into the CAL
-       * PENDING menu (REPLACE / DELETE); otherwise it is display-only. */
+      /* While a calibration is queued, the row itself is a shortcut into the
+       * CAL PENDING menu (REPLACE / DELETE); otherwise it is display-only. */
       menu_row(fb, h, y, sc, lh, "LAST CAL", cv, ccol,
                s->cal_pending > 0 ? MA_CAL_OPEN : -1);
       y += lh;
@@ -1503,12 +1576,117 @@ static void render_calpend(struct ANativeWindow_Buffer *fb,
    y += 2 * lh;
 
    int bw = fb->width - (2 * x);
-   y      = menu_button(fb, h, x, y, bw, sc, "REPLACE", 0xFFFFFFFF,
-                        MA_CAL_REPLACE);
+   y = menu_button(fb, h, x, y, bw, sc, "REPLACE", 0xFFFFFFFF, MA_CAL_REPLACE);
    y += 3 * lh; /* wide gap so DELETE (discard) is deliberate */
    /* "DELETE", not "CANCEL": CANCEL reads as "do nothing", but this button
     * DISCARDS the queued calibration. The X in the title bar is the no-op. */
    menu_button(fb, h, x, y, bw, sc, "DELETE", 0xFF0000FF, MA_CAL_CANCEL);
+}
+
+/* Format a rescale factor (permille) as a signed percentage, e.g. 1040 ->
+ * +4.0%. */
+static void fmt_rescale_pct(int pm, char *out, int n)
+{
+   int d = pm - 1000; /* tenths of a percent */
+   int a = (d < 0) ? -d : d;
+   (void)snprintf(out, n, "%c%d.%d%%", (d < 0) ? '-' : '+', a / 10, a % 10);
+}
+
+/* Confirm a rescale: shows the target value and the clamped percentage, applied
+ * only on CONFIRM. Mirrors render_cal. */
+static void render_rescale(struct ANativeWindow_Buffer *fb,
+                           const struct screen *m, struct hits *h)
+{
+   uint32_t *px = fb->bits;
+   int sc       = ui_fit_scale(fb->width, fb->height, 22);
+   int tsc      = 2 * sc;
+   int lh       = 16 * sc;
+   int x        = 4 * sc;
+   int rx       = fb->width - (4 * sc);
+   int y        = (fb->height / 20) + (8 * sc);
+   add_hit(h, 0, y - (3 * sc), fb->width, 2 * lh, ACT_MENU, MA_RESCALE_BACK);
+   if (m->sel < 0 || m->sel >= m->nsensors)
+      return;
+   const struct ui_sensor *s = &m->sensors[m->sel];
+   draw_str(px, fb, x, y, tsc, "RESCALE", 0xFFFFFFFF);
+   draw_str(px, fb, rx - (6 * tsc), y, tsc, "X", 0xFFFFFFFF);
+   y += 2 * lh;
+   menu_row(fb, h, y, sc, lh, "DEVICE", s->label, 0xFFFFFFFF, -1);
+   y += lh;
+   {
+      char b[16];
+      char v[24];
+      fmt_glu(m->rescale_entry, m->units, b, sizeof b);
+      (void)snprintf(v, sizeof v, "%s %s", b, UI_LBL(m->units));
+      menu_row(fb, h, y, sc, lh, "TARGET", v, 0xFF33FF88, -1);
+      y += lh;
+   }
+   {
+      char v[20];
+      uint32_t vc = 0xFF44CCFF;
+      if (m->rescale_pm == 0) {
+         /* No reading yet to compute against -- do not show a bogus 0%. */
+         (void)snprintf(v, sizeof v, "ON NEXT READING");
+         vc = 0xFFAAAAAA;
+      } else {
+         fmt_rescale_pct(m->rescale_pm, v, sizeof v);
+         /* Beyond +-25% will be REJECTED on CONFIRM -- flag it red. */
+         if (m->rescale_pm < 750 || m->rescale_pm > 1250)
+            vc = 0xFF4466FF;
+      }
+      menu_row(fb, h, y, sc, lh, "RESCALE BY", v, vc, -1);
+      y += lh;
+   }
+   y += 2 * lh;
+   int bw = fb->width - (2 * x);
+   y = menu_button(fb, h, x, y, bw, sc, "CANCEL", 0xFFFFFFFF, MA_RESCALE_BACK);
+   y += 3 * lh;
+   menu_button(fb, h, x, y, bw, sc, "CONFIRM", 0xFF33FF88, MA_RESCALE_ENTER);
+}
+
+/* Rescaling already active: CHANGE the value, or STOP. Mirrors render_calpend.
+ */
+static void render_rescaleact(struct ANativeWindow_Buffer *fb,
+                              const struct screen *m, struct hits *h)
+{
+   uint32_t *px = fb->bits;
+   int sc       = ui_fit_scale(fb->width, fb->height, 22);
+   int tsc      = 2 * sc;
+   int lh       = 16 * sc;
+   int x        = 4 * sc;
+   int rx       = fb->width - (4 * sc);
+   int y        = (fb->height / 20) + (8 * sc);
+   add_hit(h, 0, y - (3 * sc), fb->width, 2 * lh, ACT_MENU, MA_RESCALE_BACK);
+   if (m->sel < 0 || m->sel >= m->nsensors)
+      return;
+   const struct ui_sensor *s = &m->sensors[m->sel];
+   draw_str(px, fb, x, y, tsc, "RESCALE ON", 0xFFFFFFFF);
+   draw_str(px, fb, rx - (6 * tsc), y, tsc, "X", 0xFFFFFFFF);
+   y += 2 * lh;
+   menu_row(fb, h, y, sc, lh, "DEVICE", s->label, 0xFFFFFFFF, -1);
+   y += lh;
+   {
+      char v[32]; /* "PENDING " + value(<=11) + ' ' + unit(<=6) + NUL */
+      if (s->rescale_pending > 0) {
+         /* Held, awaiting a reading to compute the factor from. */
+         char gv[12];
+         fmt_glu(s->rescale_pending, m->units, gv, sizeof gv);
+         (void)snprintf(v, sizeof v, "PENDING %s %s", gv, UI_LBL(m->units));
+      } else {
+         fmt_rescale_pct(s->rescale_pm, v, sizeof v);
+      }
+      menu_row(fb, h, y, sc, lh, "RESCALING", v, 0xFF44CCFF, -1);
+      y += lh;
+   }
+   y += 2 * lh;
+   int bw = fb->width - (2 * x);
+   y      = menu_button(fb, h, x, y, bw, sc, "CHANGE", 0xFFFFFFFF,
+                        MA_RESCALE_CHANGE);
+   y += 3 * lh; /* wide gap so TURN OFF is deliberate */
+   /* "TURN OFF" (not STOP/CANCEL): STOP reads like ending the sensor SESSION,
+    * and CANCEL like doing nothing -- this turns rescaling off. White, not red:
+    * turning rescaling off is not destructive (no data is lost). */
+   menu_button(fb, h, x, y, bw, sc, "TURN OFF", 0xFFFFFFFF, MA_RESCALE_STOP);
 }
 
 /* ---- forget confirmation ----
@@ -1540,7 +1718,8 @@ static void render_forget(struct ANativeWindow_Buffer *fb,
 
    int rx = fb->width - (4 * sc);
    draw_str(px, fb, x, y, tsc, "FORGET?", 0xFFFFFFFF);
-   draw_str(px, fb, rx - (6 * tsc), y, tsc, "X", 0xFFFFFFFF); /* close = cancel */
+   draw_str(px, fb, rx - (6 * tsc), y, tsc, "X",
+            0xFFFFFFFF); /* close = cancel */
    y += 2 * lh;
    draw_str(px, fb, x, y, sc, s->label, 0xFFFFFFFF);
    y += 2 * lh;
@@ -1559,7 +1738,7 @@ static void render_forget(struct ANativeWindow_Buffer *fb,
     * CANCEL (safe, white) and FORGET (destructive, RED). This IS the
     * confirmation step -- MA_FORGET_YES is what actually forgets. */
    int bw = fb->width - (2 * x);
-   y      = menu_button(fb, h, x, y, bw, sc, "CANCEL", 0xFFFFFFFF, MA_FORGET_NO);
+   y = menu_button(fb, h, x, y, bw, sc, "CANCEL", 0xFFFFFFFF, MA_FORGET_NO);
    y += 3 * lh; /* wide gap so FORGET is not tapped by accident */
    menu_button(fb, h, x, y, bw, sc, "FORGET", 0xFF0000FF, MA_FORGET_YES);
 }
@@ -1576,17 +1755,17 @@ static void render_markpick(struct ANativeWindow_Buffer *fb,
    /* Graphical combined picker: shapes shown as glyphs, colours as full-colour
     * buttons, and a size row previewing the CURRENT shape+colour at each size.
     * All selections update in place; the title-row X returns to the device. */
-   int sc   = ui_fit_scale(fb->width, fb->height, 22);
-   int tsc  = 2 * sc;
-   int lh   = 16 * sc;
-   int x    = 4 * sc;
-   int rx   = fb->width - (4 * sc);
-   int y    = (fb->height / 20) + (8 * sc);
-   int back = MA_SENSOR + (m->sel >= 0 ? m->sel : 0);
-   int okk  = (m->sel >= 0 && m->sel < m->nsensors);
-   int curm = okk ? m->sensors[m->sel].marker : MARK_DOT;
-   int curc = okk ? m->sensors[m->sel].color : 0;
-   int curs = okk ? m->sensors[m->sel].size : MARK_SIZE_DEF;
+   int sc          = ui_fit_scale(fb->width, fb->height, 22);
+   int tsc         = 2 * sc;
+   int lh          = 16 * sc;
+   int x           = 4 * sc;
+   int rx          = fb->width - (4 * sc);
+   int y           = (fb->height / 20) + (8 * sc);
+   int back        = MA_SENSOR + (m->sel >= 0 ? m->sel : 0);
+   int okk         = (m->sel >= 0 && m->sel < m->nsensors);
+   int curm        = okk ? m->sensors[m->sel].marker : MARK_DOT;
+   int curc        = okk ? m->sensors[m->sel].color : 0;
+   int curs        = okk ? m->sensors[m->sel].size : MARK_SIZE_DEF;
    uint32_t curcol = ui_sensor_color(curc);
 
    draw_str(px, fb, x, y, tsc, "MARKER", 0xFFFFFFFF);
@@ -1607,8 +1786,8 @@ static void render_markpick(struct ANativeWindow_Buffer *fb,
          int cy = y + ((i / cols) * cell);
          if (mk == MARK_HIDE) {
             int lw = str_len("OFF") * 6 * sc;
-            draw_str(px, fb, cx + ((cell - lw) / 2), cy + ((cell - (7 * sc)) / 2),
-                     sc, "OFF", 0xFFAAAAAA);
+            draw_str(px, fb, cx + ((cell - lw) / 2),
+                     cy + ((cell - (7 * sc)) / 2), sc, "OFF", 0xFFAAAAAA);
          } else {
             plot_marker_glyph(px, fb->stride, fb->width, fb->height,
                               cx + (cell / 2), cy + (cell / 2), cell / 5, mk,
@@ -1629,8 +1808,9 @@ static void render_markpick(struct ANativeWindow_Buffer *fb,
       int cell = gw / cols;
       for (int i = 0; i < UI_NCOLORS; i++) {
          int cx = x + (i * cell);
-         plot_marker_glyph(px, fb->stride, fb->width, fb->height, cx + (cell / 2),
-                           y + (cell / 2), (cell - (4 * sc)) / 2, MARK_SQUARE_F,
+         plot_marker_glyph(px, fb->stride, fb->width, fb->height,
+                           cx + (cell / 2), y + (cell / 2),
+                           (cell - (4 * sc)) / 2, MARK_SQUARE_F,
                            ui_sensor_color(i));
          draw_frame(px, fb, cx + sc, y + sc, cell - (2 * sc), cell - (2 * sc),
                     (i == curc) ? 0xFF33FF88 : 0xFF555555);
@@ -1649,17 +1829,18 @@ static void render_markpick(struct ANativeWindow_Buffer *fb,
       for (int s = 1; s <= MARK_SIZE_MAX; s++) {
          int cx = x + ((s - 1) * cell);
          /* Same scaling the plot uses (radius grows linearly with size), so the
-          * preview reflects the real on-plot size rather than filling the cell. */
+          * preview reflects the real on-plot size rather than filling the cell.
+          */
          int r = (3 * sc * s) / MARK_SIZE_DEF;
          if (r < 1)
             r = 1;
-         plot_marker_glyph(px, fb->stride, fb->width, fb->height, cx + (cell / 2),
-                           y + (cell / 2), r, shape, curcol);
+         plot_marker_glyph(px, fb->stride, fb->width, fb->height,
+                           cx + (cell / 2), y + (cell / 2), r, shape, curcol);
          draw_frame(px, fb, cx + sc, y + sc, cell - (2 * sc), cell - (2 * sc),
                     (s == curs) ? 0xFF33FF88 : 0xFF555555);
          add_hit(h, cx, y, cell, cell, ACT_MENU, MA_SIZE_PICK + s);
       }
-      y += cell;
+      /* no y advance: the SIZE row is the last thing in this screen */
    }
 }
 
@@ -1772,9 +1953,9 @@ static void render_meterhelp(struct ANativeWindow_Buffer *fb,
    y += 3 * lh;
 
    static const char *const steps[] = {
-       "1. TURN THE METER ON.",       "",
-       "2. PRESS AND HOLD ITS",       "   UP ARROW UNTIL THE",
-       "   BLUETOOTH SYMBOL SHOWS.",  "",
+       "1. TURN THE METER ON.",      "",
+       "2. PRESS AND HOLD ITS",      "   UP ARROW UNTIL THE",
+       "   BLUETOOTH SYMBOL SHOWS.", "",
        "3. THEN TAP SCAN BELOW.",
    };
    for (int i = 0; i < (int)(sizeof steps / sizeof steps[0]); i++) {
@@ -1826,7 +2007,7 @@ static void render_senstype(struct ANativeWindow_Buffer *fb,
       btn_h = 40 * sc; /* a sane ceiling on very tall screens */
    if (btn_h < 16 * sc)
       btn_h = 16 * sc; /* tall enough to read clearly as a button */
-   y += gap; /* top gap */
+   y += gap;           /* top gap */
    for (int t = SENSOR_STELO; t < SENSOR_NTYPES; t++) {
       const char *nm = sensor_disp_name(t);
       draw_frame(px, fb, x, y, btn_w, btn_h, 0xFF888888);
@@ -1879,6 +2060,8 @@ static void render_keypad(struct ANativeWindow_Buffer *fb,
       kp_title = "PLOT MAX";
    else if (m->kp_mode == 2)
       kp_title = "CALIBRATION";
+   else if (m->kp_mode == 3)
+      kp_title = "RESCALE";
    else /* pairing: name the CGM being added, e.g. "PAIR NEW STELO" */
       (void)snprintf(pair_title, sizeof pair_title, "PAIR NEW %s",
                      m->add_type ? m->add_type : "SENSOR");
@@ -2085,6 +2268,8 @@ void ui_render(struct ANativeWindow_Buffer *fb, const struct screen *m,
       case SCR_SENSOR: render_sensor(fb, m, h); break;
       case SCR_CAL: render_cal(fb, m, h); break;
       case SCR_CALPEND: render_calpend(fb, m, h); break;
+      case SCR_RESCALE: render_rescale(fb, m, h); break;
+      case SCR_RESCALEACT: render_rescaleact(fb, m, h); break;
       case SCR_SENSTYPE: render_senstype(fb, m, h); break;
       case SCR_METERHELP: render_meterhelp(fb, m, h); break;
       case SCR_FORGET: render_forget(fb, m, h); break;

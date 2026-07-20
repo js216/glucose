@@ -12,12 +12,13 @@ extern char g_model[24], g_fw[24],
     g_mfr[24];                        /* DIS: model / fw / manufacturer */
 extern int g_alarm_low, g_alarm_high; /* thresholds, mg/dL */
 extern int g_sound_on, g_vib_on;      /* alarm sound / vibration */
-extern int g_orient;        /* 0 portrait 1 landscape 2 gravity 3 system */
-extern int g_screen_on;     /* 1 keep screen on while open, 0 follow the OS */
-extern int g_newdata_beep;  /* 1 = short beep on each new primary-CGM datapoint */
-extern int g_units;         /* 0 mg/dL, 1 mmol/L */
-extern int g_disc;          /* stale-data alarm: index into disc_min */
-extern int g_plot_max;      /* plot vertical-scale top, mg/dL */
+extern int g_orient;    /* 0 portrait 1 landscape 2 gravity 3 system */
+extern int g_screen_on; /* 1 keep screen on while open, 0 follow the OS */
+extern int
+    g_newdata_beep;    /* 1 = short beep on each new primary-CGM datapoint */
+extern int g_units;    /* 0 mg/dL, 1 mmol/L */
+extern int g_disc;     /* stale-data alarm: index into disc_min */
+extern int g_plot_max; /* plot vertical-scale top, mg/dL */
 extern char g_code_str[16]; /* runtime pairing code (PAIR NEW SENSOR) */
 extern char g_info_path[256], g_alarm_path[256], g_settings_path[256],
     g_code_path[256];

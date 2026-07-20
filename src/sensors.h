@@ -86,6 +86,7 @@ struct sensor_slot {
    int size;    /* marker size 1..MARK_SIZE_MAX; 0 = unset -> default */
    char label[20];
 };
+
 #define MARK_SIZE_DEF 2
 #define MARK_SIZE_MAX 5
 
@@ -121,8 +122,8 @@ long sensor_session_len(int type);
 int sensor_slot_by_mac(const char *identity);
 
 /* Fill `out` (capacity `max`) with the ids of slots whose marker is MARK_HIDE,
- * returning the count. One locked pass, so the plot's scrub path can flag hidden
- * points without a per-point registry lock. */
+ * returning the count. One locked pass, so the plot's scrub path can flag
+ * hidden points without a per-point registry lock. */
 int sensor_hidden_ids(int *out, int max);
 
 /* Mint an id for a newly paired sensor and append its provenance row. Reuses

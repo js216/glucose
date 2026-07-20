@@ -220,7 +220,8 @@ int main(void)
        * absolute values cannot be asserted because the ring is module-static
        * and earlier sections here have already populated it. */
       stat_add_at(rnow - (167L * 3600), 100, rnow);
-      int t0 = -1, a0 = -1;
+      int t0 = -1;
+      int a0 = -1;
       ck(stat_window_at(7, &t0, &a0, rnow) == 1, "the window is reportable");
 
       /* Nothing but BGM fingersticks at 400. A fingerstick is an irregular
@@ -234,7 +235,8 @@ int main(void)
          fclose(f);
       }
       stat_load(path);
-      int t1 = -1, a1 = -1;
+      int t1 = -1;
+      int a1 = -1;
       stat_window_at(7, &t1, &a1, rnow);
       ck(a1 == a0 && t1 == t0,
          "BGM fingersticks in the log do not move TIR or the average");
@@ -248,7 +250,8 @@ int main(void)
          fclose(f);
       }
       stat_load(path);
-      int t2 = -1, a2 = -1;
+      int t2 = -1;
+      int a2 = -1;
       stat_window_at(7, &t2, &a2, rnow);
       ck(a2 > a1, "...whereas CGM rows at 400 do raise the average");
 
@@ -261,7 +264,8 @@ int main(void)
          fclose(f);
       }
       stat_load(path); /* must terminate */
-      int t3 = -1, a3 = -1;
+      int t3 = -1;
+      int a3 = -1;
       ck(stat_window_at(7, &t3, &a3, rnow) == 1,
          "an absurd kind field parses without hanging");
    }

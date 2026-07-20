@@ -48,3 +48,9 @@ WarningsAsErrors: '*'
 CheckOptions:
   - key:             readability-identifier-naming.VariableCase
     value:           lower_case
+  # The crash handler writes a diagnostic line with open/write/close, which ARE
+  # async-signal-safe under POSIX. The check defaults to a "minimal" set that
+  # excludes them; select the POSIX set so it recognises them (the handler uses
+  # nothing else -- no snprintf/malloc/stdio).
+  - key:             bugprone-signal-handler.AsyncSafeFunctionSet
+    value:           POSIX

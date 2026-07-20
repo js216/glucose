@@ -41,18 +41,18 @@ struct ev {
    int len;
    int status;
 };
-static struct ev Q[1024];
+static struct ev evq[1024];
 static int qh, qt;
 
 static void q_conn(void)
 {
-   Q[qt].type = EV_CONN;
+   evq[qt].type = EV_CONN;
    qt++;
 }
 
 static void q_written(const char *u, int s)
 {
-   struct ev *e = &Q[qt++];
+   struct ev *e = &evq[qt++];
    e->type      = EV_WRITTEN;
    snprintf(e->uuid, 48, "%s", u);
    e->status = s;
@@ -60,7 +60,7 @@ static void q_written(const char *u, int s)
 
 static void q_notify(const char *u, const uint8_t *d, int n)
 {
-   struct ev *e = &Q[qt++];
+   struct ev *e = &evq[qt++];
    e->type      = EV_NOTIFY;
    snprintf(e->uuid, 48, "%s", u);
    memcpy(e->data, d, n);
@@ -99,6 +99,11 @@ void drv_subscribe(const char *uuid, int indicate)
 void drv_status(const char *s)
 {
    printf("   [status] %s\n", s);
+}
+
+void drv_cal_result(int result)
+{
+   printf("   [cal result] 0x%02x\n", result);
 }
 
 /* Capture EVERY decoded field, not just glucose. age and trend were discarded,
@@ -149,10 +154,10 @@ void drv_mac_save(const char *mac)
    mac_saved = 1;
 }
 
-int drv_mac_load(char *out, int cap)
+int drv_mac_load(char *mac, int n)
 {
-   (void)out;
-   (void)cap;
+   (void)mac;
+   (void)n;
    return 0;
 }
 
@@ -188,7 +193,7 @@ void drv_write(const char *uuid, const uint8_t *d, int n, int no_resp)
       bounds_writes++;
    if (!strcmp(uuid, U_CTRL) && n >= 3 && d[0] == 0x34) {
       cal_writes++;
-      cal_last_mgdl = (int)d[1] | ((int)d[2] << 8);
+      cal_last_mgdl = (int)((unsigned)d[1] | ((unsigned)d[2] << 8U));
    }
    q_written(uuid, 0);
    if (!strcmp(uuid, U_AUTH) && n >= 2 && d[0] == 0x0a) { /* round request */
@@ -196,15 +201,19 @@ void drv_write(const char *uuid, const uint8_t *d, int n, int no_resp)
       mock_round = d[1];
       drlen      = 0;
       uint8_t pkt[160];
-      int ok = mock_round == 0   ? dexpair_round1(sensor, pkt)
-               : mock_round == 1 ? dexpair_round2(sensor, pkt)
-                                 : dexpair_round3(sensor, pkt);
+      int ok = 0;
+      if (mock_round == 0)
+         ok = dexpair_round1(sensor, pkt);
+      else if (mock_round == 1)
+         ok = dexpair_round2(sensor, pkt);
+      else
+         ok = dexpair_round3(sensor, pkt);
       if (!ok) {
          printf("   !! sensor round%d build failed\n", mock_round + 1);
          return;
       }
       for (int i = 0; i < 8; i++)
-         q_notify(U_ROUND, pkt + i * 20, 20); /* sensor's round */
+         q_notify(U_ROUND, pkt + ((size_t)i * 20), 20); /* sensor's round */
    } else if (!strcmp(uuid, U_ROUND) &&
               mock_phase == 0) { /* driver's round chunk */
       if (drlen + n <= 160) {
@@ -212,9 +221,13 @@ void drv_write(const char *uuid, const uint8_t *d, int n, int no_resp)
          drlen += n;
       }
       if (drlen >= 160) {
-         int ok = mock_round == 0   ? dexpair_peer_round1(sensor, drv_round)
-                  : mock_round == 1 ? dexpair_peer_round2(sensor, drv_round)
-                                    : dexpair_peer_round3(sensor, drv_round);
+         int ok = 0;
+         if (mock_round == 0)
+            ok = dexpair_peer_round1(sensor, drv_round);
+         else if (mock_round == 1)
+            ok = dexpair_peer_round2(sensor, drv_round);
+         else
+            ok = dexpair_peer_round3(sensor, drv_round);
          printf("   [sensor] driver round%d ZKP %s\n", mock_round + 1,
                 ok ? "VALID" : "INVALID");
          if (mock_round == 2) {
@@ -233,7 +246,8 @@ void drv_write(const char *uuid, const uint8_t *d, int n, int no_resp)
       rx[0] = 0x03;
       dexauth_dex8(skey, d + 1, rx + 1);
       if (spoof_mode)
-         rx[1] ^= 0xff; /* peer does NOT hold the shared key */
+         rx[1] =
+             (uint8_t)(rx[1] ^ 0xffU); /* peer does NOT hold the shared key */
       memcpy(rx + 9, schallenge, 8);
       q_notify(U_AUTH, rx, 17);
    } else if (!strcmp(uuid, U_AUTH) && n >= 9 &&
@@ -280,7 +294,7 @@ void drv_write(const char *uuid, const uint8_t *d, int n, int no_resp)
 static void pump(void)
 {
    while (qh < qt) {
-      struct ev *e = &Q[qh++];
+      struct ev *e = &evq[qh++];
       if (e->type == EV_CONN)
          driver_on_connected();
       else if (e->type == EV_WRITTEN)
@@ -309,13 +323,13 @@ int main(void)
    printf("---- pairing result ----\n");
    printf("  [%s] sensor accepted our ChallengeReply (mutual auth)\n",
           auth_ok ? "PASS" : "FAIL");
-   all &= auth_ok;
+   all = all && auth_ok;
    printf("  [%s] saved key equals sensor's derived key (J-PAKE agreed)\n",
           key_saved_matches == 1 ? "PASS" : "FAIL");
-   all &= (key_saved_matches == 1);
+   all = all && (key_saved_matches == 1);
    printf("  [%s] decoded glucose from stream = %d (expect 165)\n",
           glucose_seen == 165 ? "PASS" : "FAIL", glucose_seen);
-   all &= (glucose_seen == 165);
+   all = all && (glucose_seen == 165);
    memcpy(preset_key, skey,
           16); /* reuse the agreed key for the reconnect test */
    dexpair_free(sensor);
@@ -332,18 +346,18 @@ int main(void)
    printf("---- reconnect result ----\n");
    printf("  [%s] authenticated with saved key (skipped J-PAKE rounds)\n",
           auth_ok ? "PASS" : "FAIL");
-   all &= auth_ok;
+   all = all && auth_ok;
    printf("  [%s] decoded glucose = %d (expect 165)\n",
           glucose_seen == 165 ? "PASS" : "FAIL", glucose_seen);
-   all &= (glucose_seen == 165);
+   all = all && (glucose_seen == 165);
    /* The captured frame decodes to trend -2 and age 4 (see the EGV log line).
     * Asserting them pins the field OFFSETS, not just one value. */
    printf("  [%s] decoded trend = %d (expect -2)\n",
           glu_trend == -2 ? "PASS" : "FAIL", glu_trend);
-   all &= (glu_trend == -2);
+   all = all && (glu_trend == -2);
    printf("  [%s] decoded age = %d (expect 4)\n",
           glu_age == 4 ? "PASS" : "FAIL", glu_age);
-   all &= (glu_age == 4);
+   all = all && (glu_age == 4);
    /* The rest of the EGV layout, via the session snapshot the UI reads. The
     * captured frame is 4e 00 31080800 dd06 0001 0400 a500 06 fe a500:
     * clock=0x00080831, sequence=0x06dd, predicted=0x00a5 & 0x3ff. Asserting
@@ -353,16 +367,16 @@ int main(void)
       driver_get_session(&ds);
       int okseq = (ds.sequence == 1757);
       int okpre = (ds.predicted == 165);
-      int okclk = (ds.session_seconds == 526385u);
+      int okclk = (ds.session_seconds == 526385U);
       printf("  [%s] sequence = %d (expect 1757)\n", okseq ? "PASS" : "FAIL",
              ds.sequence);
-      all &= okseq;
+      all = all && okseq;
       printf("  [%s] predicted = %d (expect 165)\n", okpre ? "PASS" : "FAIL",
              ds.predicted);
-      all &= okpre;
+      all = all && okpre;
       printf("  [%s] session clock = %u (expect 526385)\n",
              okclk ? "PASS" : "FAIL", ds.session_seconds);
-      all &= okclk;
+      all = all && okclk;
    }
 
    /* ---- a peer that does NOT hold the shared key must be refused ----
@@ -386,7 +400,7 @@ int main(void)
       int refused = (glucose_seen == -1);
       printf("  [%s] spoofed peer produced NO glucose (got %d)\n",
              refused ? "PASS" : "FAIL", glucose_seen);
-      all &= refused;
+      all = all && refused;
    }
    spoof_mode = 0;
 
@@ -405,7 +419,7 @@ int main(void)
       printf(
           "  [%s] peer SKIPPING AuthChallenge produced NO glucose (got %d)\n",
           refused ? "PASS" : "FAIL", glucose_seen);
-      all &= refused;
+      all = all && refused;
    }
    skip_chal_mode = 0;
 
@@ -424,7 +438,7 @@ int main(void)
       int back = (glucose_seen == 165);
       printf("  [%s] genuine sensor still accepted after a spoof attempt\n",
              back ? "PASS" : "FAIL");
-      all &= back;
+      all = all && back;
    }
 
    /* ---- calibration interlocks (0x34 is the only write that changes how a
@@ -438,13 +452,13 @@ int main(void)
       int have0 = !c.have;
       printf("  [%s] bounds unknown until 0x32 answers (have=%d)\n",
              have0 ? "PASS" : "FAIL", c.have);
-      all &= have0;
+      all = all && have0;
 
       cal_writes = 0;
       driver_calibrate(120);
       printf("  [%s] REFUSED while bounds unknown (0x34 writes=%d)\n",
              cal_writes == 0 ? "PASS" : "FAIL", cal_writes);
-      all &= (cal_writes == 0);
+      all = all && (cal_writes == 0);
 
       /* Answer 0x32 saying calibration is NOT permitted. */
       uint8_t nb[16] = {0x32, 0, 0, 0, 0, 0, 0, 0x64, 0x00, 0, 0, 0, 0, 1, 0};
@@ -455,7 +469,7 @@ int main(void)
       printf("  [%s] REFUSED when firmware says not permitted (permitted=%d "
              "writes=%d)\n",
              cal_writes == 0 ? "PASS" : "FAIL", c.permitted, cal_writes);
-      all &= (cal_writes == 0);
+      all = all && (cal_writes == 0);
 
       /* Now permit it, and check the range guard and the accepted path. */
       uint8_t yb[16] = {0x32, 0, 0, 0, 0, 0, 0, 0x64, 0x00, 0, 0, 0, 0, 1, 1};
@@ -464,18 +478,18 @@ int main(void)
       int permitted = c.have && c.permitted;
       printf("  [%s] bounds parsed: have=%d permitted=%d\n",
              permitted ? "PASS" : "FAIL", c.have, c.permitted);
-      all &= permitted;
+      all = all && permitted;
 
       cal_writes = 0;
       driver_calibrate(39);
       printf("  [%s] REFUSED below range (39)\n",
              cal_writes == 0 ? "PASS" : "FAIL");
-      all &= (cal_writes == 0);
+      all        = all && (cal_writes == 0);
       cal_writes = 0;
       driver_calibrate(401);
       printf("  [%s] REFUSED above range (401)\n",
              cal_writes == 0 ? "PASS" : "FAIL");
-      all &= (cal_writes == 0);
+      all = all && (cal_writes == 0);
 
       cal_writes    = 0;
       cal_last_mgdl = -1;
@@ -483,7 +497,7 @@ int main(void)
       int ok = (cal_writes == 1 && cal_last_mgdl == 137);
       printf("  [%s] ACCEPTED in range, value on the wire = %d (expect 137)\n",
              ok ? "PASS" : "FAIL", cal_last_mgdl);
-      all &= ok;
+      all = all && ok;
    }
 
    printf("========== UNSOLICITED 0x34 ==========\n");
@@ -507,7 +521,7 @@ int main(void)
       driver_unlock();
       printf("  [%s] three unsolicited 0x34 replies emit no 0x32 (%d new)\n",
              bounds_writes == before ? "PASS" : "FAIL", bounds_writes - before);
-      all &= (bounds_writes == before);
+      all = all && (bounds_writes == before);
    }
 
    printf("\n%s\n", all ? "ALL DRIVER TESTS PASSED" : "SOME TESTS FAILED");

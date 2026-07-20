@@ -201,8 +201,8 @@ int sensor_slot_by_mac(const char *identity)
 
 int sensor_hidden_ids(int *out, int max)
 {
-   /* The ids of slots whose marker is MARK_HIDE (the device is OFF the plot), in
-    * one locked pass so a caller can flag hidden points without taking the
+   /* The ids of slots whose marker is MARK_HIDE (the device is OFF the plot),
+    * in one locked pass so a caller can flag hidden points without taking the
     * registry lock per point. There are at most MAX_SLOTS of them. */
    reg_lock();
    int n = 0;
@@ -443,10 +443,10 @@ int sensor_mint(int type, const char *identity, const char *serial,
     * reading -- the bare mint (empty model/fw) and the with-model mint got
     * DIFFERENT ids. Everything logged under the bare id was then orphaned:
     * cited by an id no slot pointed at, drawn on the plot as gray crosses, its
-    * history split off from the device the user still holds. Keying on MAC alone
-    * makes an id map to one PHYSICAL device for life. A CGM session always
-    * brings a new MAC, so sessions still separate cleanly; a meter keeps one MAC,
-    * so all its fingersticks group under one id, forever. */
+    * history split off from the device the user still holds. Keying on MAC
+    * alone makes an id map to one PHYSICAL device for life. A CGM session
+    * always brings a new MAC, so sessions still separate cleanly; a meter keeps
+    * one MAC, so all its fingersticks group under one id, forever. */
    int slotidx = sensor_slot_by_mac(identity);
    if (slotidx >= 0) {
       /* Already tracked by a live slot: ALL of this device's readings belong to
@@ -462,8 +462,8 @@ int sensor_mint(int type, const char *identity, const char *serial,
       if (r->id > maxid)
          maxid = r->id;
       /* No slot yet, but a provenance row for this (type, MAC) already exists
-       * (e.g. from an earlier launch): reuse its id rather than minting another.
-       * activation/model/fw differences do NOT fork the id anymore. */
+       * (e.g. from an earlier launch): reuse its id rather than minting
+       * another. activation/model/fw differences do NOT fork the id anymore. */
       if (r->type == type && !strcmp(r->identity, identity)) {
          int id = r->id;
          reg_unlock();
@@ -500,7 +500,8 @@ int sensor_mint(int type, const char *identity, const char *serial,
       return -1;
    }
    if (lseek(fd, 0, SEEK_END) == 0) { /* self-describing header on a new file */
-      if (write(fd, g_sensors_hdr, sizeof g_sensors_hdr - 1) < 0) { /* best eff */
+      if (write(fd, g_sensors_hdr, sizeof g_sensors_hdr - 1) <
+          0) { /* best eff */
       }
    }
    char b[192];

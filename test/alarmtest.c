@@ -218,15 +218,13 @@ int main(void)
       alarm_decide(AL_HIGH, want, 1, 0, &o);
       ck(o.act == AL_ACT_TRIGGER && o.acked == 0,
          "5. a CHANGED level announces and clears the acknowledgement");
-      want  = o.want;
-      acked = o.acked;
+      want = o.want;
 
       /* 6. returning to range silences */
       alarm_decide(AL_NONE, want, 1, 0, &o);
       ck(o.act == AL_ACT_SILENCE && o.want == AL_NONE,
          "6. returning to range silences");
-      want  = o.want;
-      acked = o.acked;
+      want = o.want;
 
       /* 7. and a later low can sound again */
       alarm_decide(AL_LOW, want, 1, 0, &o);

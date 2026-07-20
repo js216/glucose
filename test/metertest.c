@@ -23,6 +23,7 @@
  */
 #include "otble.h"
 #include "util.h" /* realtime_s: the driver bounds against it */
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 

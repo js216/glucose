@@ -85,8 +85,8 @@ void aes128_encrypt(const uint8_t key[16], const uint8_t in[16],
             uint8_t a2   = col[2];
             uint8_t a3   = col[3];
             col[0]       = (uint8_t)((unsigned)xtime(a0) ^
-                               ((unsigned)xtime(a1) ^ (unsigned)a1) ^
-                               (unsigned)a2 ^ (unsigned)a3);
+                                     ((unsigned)xtime(a1) ^ (unsigned)a1) ^
+                                     (unsigned)a2 ^ (unsigned)a3);
             col[1] =
                 (uint8_t)((unsigned)a0 ^ (unsigned)xtime(a1) ^
                           ((unsigned)xtime(a2) ^ (unsigned)a2) ^ (unsigned)a3);

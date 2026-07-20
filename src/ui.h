@@ -46,17 +46,18 @@ void fmt_dur(long seconds, char *out, int n);
  * truncating it, so a cramped screen is a visible error, not a quiet lie. */
 #define UI_MIN_SLOTS 3
 
-/* Rows the settings screen consumes ABOVE the sensor entries: title (2),
- * DISPLAY (6), ALARM (5), PERMISSIONS (8), the SENSORS header (1) and the
- * trailing ADD row (1). Keep in step with render_settings.
+/* Rows the settings screen consumes ABOVE (and below) the sensor entries: title
+ * (2), DISPLAY (6), ALARM (5), PERMISSIONS (8), the DEVICES header (1), and the
+ * two trailing framed buttons -- ADD NEW DEVICE and EXPORT DATA -- each a
+ * separator + a ~1-row button (4 total). Keep in step with render_settings.
  *
  * Exported deliberately. It used to be private to ui.c while test/uitest.c
- * carried its own literal 23 for the same quantity, so the two could drift
+ * carried its own literal for the same quantity, so the two could drift
  * apart silently -- and adding rows to render_settings without bumping this is
  * exactly the mistake that leaves sensor rows and their tap targets below the
  * bottom of the screen, permanently unreachable because there is no
  * scrolling. One definition, both users. */
-#define UI_SET_ABOVE 23
+#define UI_SET_ABOVE 26
 
 /* How many sensor rows fit in the settings screen at this geometry, given
  * everything above the SENSORS section. The whole UI never scrolls, so this is
@@ -98,16 +99,27 @@ enum ui_screen {
    SCR_KEYPAD,
    SCR_DEVLIST,
    SCR_GATE,
-   SCR_SENSOR,   /* one sensor: attributes above, actions below */
-   SCR_CAL,      /* that sensor's calibration panel */
-   SCR_CALPEND,  /* a calibration is already queued: REPLACE / CANCEL */
-   SCR_SENSTYPE, /* pick a sensor type when adding */
-   SCR_FORGET,   /* confirm forgetting a sensor */
-   SCR_LABEL,     /* rename a sensor (letter keypad) */
-   SCR_MARKPICK,  /* marker-shape picker */
-   SCR_COLORPICK, /* colour picker */
-   SCR_METERHELP, /* OneTouch: how-to-connect + Scan button */
+   SCR_SENSOR,     /* one sensor: attributes above, actions below */
+   SCR_CAL,        /* that sensor's calibration panel */
+   SCR_CALPEND,    /* a calibration is already queued: REPLACE / CANCEL */
+   SCR_RESCALE,    /* confirm a rescale value */
+   SCR_RESCALEACT, /* rescaling active: CHANGE / STOP */
+   SCR_SENSTYPE,   /* pick a sensor type when adding */
+   SCR_FORGET,     /* confirm forgetting a sensor */
+   SCR_LABEL,      /* rename a sensor (letter keypad) */
+   SCR_MARKPICK,   /* marker-shape picker */
+   SCR_COLORPICK,  /* colour picker */
+   SCR_METERHELP,  /* OneTouch: how-to-connect + Scan button */
    SCR_N
+};
+
+/* Resolved calibration kinds, for the LAST CAL row (ui_sensor.cal_state). */
+enum {
+   CAL_ST_NONE = 0,
+   CAL_ST_APPLIED,  /* accepted: cal_mgdl is the value */
+   CAL_ST_REJECTED, /* the sensor rejected this VALUE (0x34 result) */
+   CAL_ST_NOTSUP,   /* the sensor does not permit calibration (0x32) */
+   CAL_ST_FAILED    /* never accepted within the retry window */
 };
 
 struct ui_point {
@@ -120,22 +132,29 @@ struct ui_point {
 /* One configured sensor: everything the list row AND the detail screen need,
  * so the shell hands over a single self-contained snapshot per sensor. */
 struct ui_sensor {
+   /* Longs first, then ints, then char arrays -- packed to avoid alignment
+    * padding (clang-analyzer-optin.performance.Padding). */
    long last;            /* last reading (CGM) or sync (BGM); 0 = never */
    long session_seconds; /* CGM session length */
+   long rssi_t;       /* wall-clock of the RSSI sample, for its "N M AGO" age */
+   long meter_sync_t; /* meter only: when the app last synced it (vs last
+                         datapoint) */
+   long cal_t;        /* when the last calibration RESOLVED; 0 = never */
    int id, type, kind;
    int color, marker, primary, size;
    int glu, trend, predicted, sequence;
    int rssi, rssi_ok, connected;
-   long rssi_t;      /* wall-clock of the RSSI sample, for its "N M AGO" age */
-   long meter_sync_t; /* meter only: when the app last synced it (vs last datapoint) */
    /* Calibration state for this CGM's LAST CAL row. cal_pending!=0 means a
     * calibration is queued and not yet accepted (cal_pending is its mg/dL);
-    * otherwise cal_t>0 gives the last RESOLVED calibration -- cal_mgdl mg/dL if
-    * cal_ok, else a failure. */
+    * otherwise cal_t>0 gives the last RESOLVED calibration, whose kind is
+    * cal_state (CAL_ST_*) and value cal_mgdl. */
    int cal_pending;
    int cal_mgdl;
-   int cal_ok;
-   long cal_t;
+   int cal_state;        /* CAL_ST_* */
+   int rescale_pm;       /* active rescale factor (permille); 1000 = none */
+   int rescale_pending;  /* target mg/dL awaiting a reading; 0 = none */
+   int rescale_rejected; /* last attempt exceeded +-25% and was rejected */
+   int rescale_expired;  /* a pending target timed out awaiting a reading */
    /* label must hold a full sensor_slot.label (sensors.h) -- at 12 it truncated
     * the default meter name "ONETOUCH-AB:CD" to "ONETOUCH-AB", cutting off
     * exactly the MAC tail that tells two meters apart. */
@@ -182,7 +201,7 @@ struct screen {
    int bonded, paired, have_reading, predicted, sequence;
    /* settings (values, not the module's globals) */
    int units, alarm_low, alarm_high, sound_on, vib_on, orient, disc;
-   int screen_on;    /* 1 = hold the screen awake while open, 0 = follow the OS */
+   int screen_on; /* 1 = hold the screen awake while open, 0 = follow the OS */
    int newdata_beep; /* 1 = beep on each new primary-CGM datapoint */
    /* sensor registry: the list in settings, and which one a detail screen is
     * showing (sel indexes `sensors`; -1 when no detail screen is open) */
@@ -190,6 +209,11 @@ struct screen {
    /* last 0x32/0x34 answers for the selected sensor */
    int cal_have, cal_permitted, cal_status, cal_last_bg, cal_result;
    int cal_pending; /* value awaiting CONFIRM, mg/dL; 0 = none */
+   /* RESCALE screens: the value being confirmed (mg/dL), and the factor to show
+    * (permille) -- the clamped preview on SCR_RESCALE, the active one on
+    * SCR_RESCALEACT. */
+   int rescale_entry;
+   int rescale_pm;
    /* modal/UX state */
    int stored, ndev;
    int kp_mode; /* keypad: 0 = pairing code, 1 = plot-max entry */
@@ -232,20 +256,20 @@ enum {
  * MA_SENSOR, MA_DIGIT, MA_TYPE, MA_DEV_PICK) are bases with an index added, so
  * leave the gaps after them alone. Values are historical -- do not renumber. */
 enum ui_menu {
-   MA_ORIENT      = 0,
-   MA_SOUND       = 1,
-   MA_VIB         = 2,
-   MA_UNITS       = 3,
-   MA_DISC        = 4,
-   MA_SCREEN      = 5,
-   MA_NEWDATA     = 6, /* toggle the new-datapoint beep */
-   MA_METERSCAN   = 7, /* start scanning from the OneTouch instructions screen */
-   MA_PERM        = 10, /* + permission index (0..2) */
-   MA_BATTERY     = 20,
-   MA_BGEXEC      = 22,
-   MA_PAIR_CODE   = 30,
-   MA_PLOTMAX     = 31,
-   MA_SENSOR      = 40, /* + slot index; opens that sensor's screen */
+   MA_ORIENT    = 0,
+   MA_SOUND     = 1,
+   MA_VIB       = 2,
+   MA_UNITS     = 3,
+   MA_DISC      = 4,
+   MA_SCREEN    = 5,
+   MA_NEWDATA   = 6,  /* toggle the new-datapoint beep */
+   MA_METERSCAN = 7,  /* start scanning from the OneTouch instructions screen */
+   MA_PERM      = 10, /* + permission index (0..2) */
+   MA_BATTERY   = 20,
+   MA_BGEXEC    = 22,
+   MA_PAIR_CODE = 30,
+   MA_PLOTMAX   = 31,
+   MA_SENSOR    = 40, /* + slot index; opens that sensor's screen */
    MA_SENSOR_BACK = 48,
    MA_ADDSENSOR   = 49,
    MA_PRIMARY     = 50,
@@ -263,18 +287,24 @@ enum ui_menu {
    MA_CAL_BACK    = 62,
    MA_CAL_REPLACE = 63, /* pending-cal screen: enter a new value (supersedes) */
    MA_CAL_CANCEL  = 64, /* pending-cal screen: discard the queued calibration */
-   MA_TYPE        = 70, /* + sensor type (SENSOR_STELO..) */
-   MA_CLOSE       = 99,
-   MA_DIGIT       = 100, /* + digit 0..9 */
-   MA_OK          = 111, /* keypad / label confirm */
-   MA_BACKSPACE   = 110,
-   MA_KP_CLOSE    = 113,
-   MA_DEV_CANCEL  = 199,
-   MA_DEV_PICK    = 200, /* + scanned-device index */
-   MA_MARK_PICK   = 220, /* + marker enum value */
-   MA_COLOR_PICK  = 240, /* + colour index */
-   MA_SIZE_PICK   = 250, /* + size 1..MARK_SIZE_MAX */
-   MA_CHAR        = 300  /* + index into ui_label_chars[] */
+   MA_RESCALE_OPEN   = 65, /* RESCALE row: keypad, or the active screen */
+   MA_RESCALE_ENTER  = 66, /* confirm a rescale value */
+   MA_RESCALE_BACK   = 67, /* leave a rescale screen unchanged */
+   MA_RESCALE_CHANGE = 68, /* active screen: enter a new value */
+   MA_RESCALE_STOP   = 69, /* active screen: turn rescaling off */
+   MA_TYPE           = 70, /* + sensor type (SENSOR_STELO..) */
+   MA_EXPORT     = 75, /* settings: EXPORT DATA via the system share sheet */
+   MA_CLOSE      = 99,
+   MA_DIGIT      = 100, /* + digit 0..9 */
+   MA_OK         = 111, /* keypad / label confirm */
+   MA_BACKSPACE  = 110,
+   MA_KP_CLOSE   = 113,
+   MA_DEV_CANCEL = 199,
+   MA_DEV_PICK   = 200, /* + scanned-device index */
+   MA_MARK_PICK  = 220, /* + marker enum value */
+   MA_COLOR_PICK = 240, /* + colour index */
+   MA_SIZE_PICK  = 250, /* + size 1..MARK_SIZE_MAX */
+   MA_CHAR       = 300  /* + index into ui_label_chars[] */
 };
 
 /* THE RANGES MUST NOT OVERLAP, and the compiler is the only thing that will

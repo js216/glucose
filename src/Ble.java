@@ -26,8 +26,10 @@ import android.bluetooth.le.ScanResult;
 import android.bluetooth.le.ScanSettings;
 import android.app.Activity;
 import android.content.Context;
+import android.content.Intent;
 import android.content.pm.ActivityInfo;
 import android.content.pm.PackageManager;
+import android.net.Uri;
 import android.util.Log;
 
 import java.util.ArrayDeque;
@@ -39,6 +41,42 @@ public final class Ble {
         UUID.fromString("00002902-0000-1000-8000-00805f9b34fb");
 
     /* ---- settings-menu helpers (ctx is the NativeActivity, i.e. an Activity) ---- */
+
+    /* EXPORT DATA: build ONE file -- sensors.csv (the device map), a blank line,
+     * then readings.csv (the log) -- and hand it to another app via the system
+     * share sheet. The content:// URI comes from StealoFiles (see the manifest);
+     * FLAG_GRANT_READ_URI_PERMISSION lets the chosen app read it. */
+    public static void exportData(Context ctx) {
+        try {
+            java.io.File dir = ctx.getFilesDir();
+            java.io.File out = new java.io.File(dir, "stealo.csv");
+            java.io.FileOutputStream os = new java.io.FileOutputStream(out);
+            copyInto(os, new java.io.File(dir, "sensors.csv"));
+            os.write('\n'); /* blank line between the two sections */
+            copyInto(os, new java.io.File(dir, "readings.csv"));
+            os.close();
+            if (out.length() == 0) return;
+            Uri uri = Uri.parse("content://com.jk.stealo.files/stealo.csv");
+            Intent send = new Intent(Intent.ACTION_SEND);
+            send.putExtra(Intent.EXTRA_STREAM, uri);
+            send.setType("text/csv");
+            send.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+            Intent chooser = Intent.createChooser(send, "Export stealo data");
+            chooser.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            ctx.startActivity(chooser);
+        } catch (Throwable t) { Log.i(TAG, "export: " + t); }
+    }
+
+    private static void copyInto(java.io.OutputStream os, java.io.File f)
+            throws java.io.IOException {
+        if (!f.exists()) return;
+        java.io.FileInputStream is = new java.io.FileInputStream(f);
+        byte[] buf = new byte[4096];
+        int n;
+        while ((n = is.read(buf)) > 0) os.write(buf, 0, n);
+        is.close();
+    }
+
     /* mode: 0 portrait, 1 landscape, 2 gravity (sensor always), 3 system (sensor
      * only if the OS auto-rotate setting allows it) */
     public static void setOrientation(Context ctx, int mode) {

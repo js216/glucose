@@ -110,7 +110,7 @@ int main(void)
          "just inside the interval: still throttled");
       s.last_attempt = s.now - SCAN_RETRY_S;
       ck(scan_should_start(&s) == 1, "at the interval: retry");
-      s.last_attempt = s.now - (SCAN_RETRY_S * 10);
+      s.last_attempt = s.now - (SCAN_RETRY_S * 10L);
       ck(scan_should_start(&s) == 1, "long after: retry");
    }
 
@@ -137,7 +137,7 @@ int main(void)
    printf("== the throttle never outranks a hard reason ==\n");
    {
       struct scan_state s = ok_state();
-      s.last_attempt      = s.now - (SCAN_RETRY_S * 10);
+      s.last_attempt      = s.now - (SCAN_RETRY_S * 10L);
       s.paused            = 1;
       ck(scan_should_start(&s) == 0,
          "an elapsed throttle does not override pause");

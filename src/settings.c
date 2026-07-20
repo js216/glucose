@@ -16,7 +16,8 @@ int g_alarm_low = 110, g_alarm_high = 300;
 int g_sound_on = 1, g_vib_on = 1;
 int g_orient;
 int g_screen_on = 1; /* default: hold the screen on, as the app always has */
-int g_newdata_beep;  /* short beep on each new primary-CGM datapoint (OFF/BEEP) */
+int g_newdata_beep;  /* short beep on each new primary-CGM datapoint (OFF/BEEP)
+                      */
 int g_units;
 int g_disc;
 int g_plot_max      = PLOT_GLU_MAX;
@@ -160,8 +161,8 @@ void settings_load(void)
    if (n <= 0)
       return;
    b[n]     = 0;
-   int v[8] = {g_sound_on, g_vib_on,   g_orient,     g_units,
-               g_disc,     g_plot_max, g_screen_on,  g_newdata_beep};
+   int v[8] = {g_sound_on, g_vib_on,   g_orient,    g_units,
+               g_disc,     g_plot_max, g_screen_on, g_newdata_beep};
    char *q  = b;
    for (int i = 0; i < 8; i++) {
       while (*q == ' ')
@@ -179,12 +180,12 @@ void settings_load(void)
       }
       v[i] = x;
    }
-   g_sound_on  = v[0];
-   g_vib_on    = v[1];
-   g_orient    = (int)((unsigned)v[2] & 3U);
-   g_units     = v[3] ? 1 : 0;
-   g_disc      = (v[4] >= 0 && v[4] < 4) ? v[4] : 0;
-   g_plot_max  = (v[5] >= 100 && v[5] <= 400) ? v[5] : PLOT_GLU_MAX;
+   g_sound_on     = v[0];
+   g_vib_on       = v[1];
+   g_orient       = (int)((unsigned)v[2] & 3U);
+   g_units        = v[3] ? 1 : 0;
+   g_disc         = (v[4] >= 0 && v[4] < 4) ? v[4] : 0;
+   g_plot_max     = (v[5] >= 100 && v[5] <= 400) ? v[5] : PLOT_GLU_MAX;
    g_screen_on    = v[6] ? 1 : 0;
    g_newdata_beep = v[7] ? 1 : 0;
    plot_set_max(g_plot_max);

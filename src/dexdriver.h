@@ -99,8 +99,9 @@ void driver_request_backfill(
 /* Ask the sensor what it permits. Read-only: mutates no sensor state. */
 void driver_cal_bounds(void);
 /* Submit a calibration in mg/dL. User-initiated only. Returns 1 if the write
- * was issued, 0 if refused (not streaming / not permitted / out of range) -- the
- * shell keeps the value queued and retries on a 0 rather than dropping it. */
+ * was issued, 0 if refused (not streaming / not permitted / out of range) --
+ * the shell keeps the value queued and retries on a 0 rather than dropping it.
+ */
 int driver_calibrate(int mg_dl);
 
 /* Last known answer to 0x32, plus the last 0x34 result. */

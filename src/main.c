@@ -55,13 +55,21 @@ _Static_assert(MA_DEV_PICK + MAX_DEVS <= MA_CHAR,
 #define NOTIFY_W 512 /* lock-screen plot bitmap width (px) */
 #define NOTIFY_H 160 /* lock-screen plot bitmap height (px) */
 
-/* POSIX file I/O + kernel-timer calls (no standard header; libc binds at
- * runtime). CLOCK_MONOTONIC is for the repaint timerfd below. */
+/* POSIX file I/O + kernel-timer calls. This is a FREESTANDING build with a
+ * minimal stub libc (no NDK sysroot on the include path), so the system headers
+ * that would declare these do not exist here -- they are hand-declared and libc
+ * binds them at runtime. CLOCK_MONOTONIC is for the repaint timerfd below.
+ *
+ * (An editor configured with the normal Android sysroot sees BOTH this and the
+ * system <time.h> and reports a redefinition of itimerspec; that is a tooling
+ * mismatch, not a build defect -- the compiler here has no system header.) */
+#ifndef CLOCK_MONOTONIC
 #define CLOCK_MONOTONIC 1
 
 struct itimerspec {
    struct timespec it_interval, it_value;
 };
+#endif
 
 int timerfd_create(int clockid, int flags);
 int timerfd_settime(int fd, int flags, const struct itimerspec *nv,
@@ -152,6 +160,8 @@ static jclass g_ble; /* global ref to com.jk.stealo.Ble */
 static jmethodID g_scan, g_stop;
 static jmethodID m_set_orient, m_perm_granted, m_req_perm,
     m_open_settings; /* settings-menu ops */
+static jmethodID
+    m_export; /* EXPORT DATA: share the CSVs via the system sheet */
 static jmethodID m_batt_ok, m_req_batt, m_bucket,
     m_bg_restricted;             /* background-run ops */
 static jmethodID m_show_glucose; /* push value+plot to the notification */
@@ -218,15 +228,17 @@ enum {
    MENU_SETTINGS,
    MENU_KEYPAD,
    MENU_DEVLIST,
-   MENU_SENSOR,   /* one sensor's detail screen */
-   MENU_CAL,      /* that sensor's calibration panel */
-   MENU_CALPEND,  /* a calibration is queued: REPLACE / CANCEL */
-   MENU_SENSTYPE,  /* sensor-type picker (first step of ADD SENSOR) */
-   MENU_FORGET,    /* confirm forgetting a sensor */
-   MENU_LABEL,     /* rename a sensor */
-   MENU_MARKPICK,  /* marker-shape picker */
-   MENU_COLORPICK, /* colour picker */
-   MENU_METERHELP  /* OneTouch: instructions + Scan */
+   MENU_SENSOR,     /* one sensor's detail screen */
+   MENU_CAL,        /* that sensor's calibration panel */
+   MENU_CALPEND,    /* a calibration is queued: REPLACE / CANCEL */
+   MENU_RESCALE,    /* confirm a rescale value */
+   MENU_RESCALEACT, /* rescaling active: CHANGE / STOP */
+   MENU_SENSTYPE,   /* sensor-type picker (first step of ADD SENSOR) */
+   MENU_FORGET,     /* confirm forgetting a sensor */
+   MENU_LABEL,      /* rename a sensor */
+   MENU_MARKPICK,   /* marker-shape picker */
+   MENU_COLORPICK,  /* colour picker */
+   MENU_METERHELP   /* OneTouch: instructions + Scan */
 }; /* g_menu / g_kp_return values */
 
 /* Smart pairing (PAIR NEW SENSOR): scans for candidates while the code is
@@ -255,29 +267,171 @@ static const char *perms[] = {"android.permission.BLUETOOTH_SCAN",
  * main thread (menu open / after an action) and build_model just copies them.
  */
 static int g_sys_perm[NPERMS], g_sys_batt, g_sys_bucket, g_sys_bg;
-static char g_entry[24];   /* keypad digits, or a sensor name being typed */
-static int g_entrylen;     /* keypad entry buffer */
-static int g_kp_mode;      /* keypad: 0 = pair code, 1 = plot max, 2 = cal */
-static int g_cal_pending;  /* calibration value awaiting CONFIRM, mg/dL; 0 = none */
+static char g_entry[24]; /* keypad digits, or a sensor name being typed */
+static int g_entrylen;   /* keypad entry buffer */
+static int g_kp_mode;    /* keypad: 0 = pair code, 1 = plot max, 2 = cal */
+static int
+    g_cal_pending; /* calibration value awaiting CONFIRM, mg/dL; 0 = none */
 /* DURABLE calibration queue: a CONFIRMED calibration that has not yet been
  * ACCEPTED by the sensor. It is persisted to disk and retried on every stream
  * until the sensor answers -- so a calibration is NEVER lost to a reconnect gap
  * or an app restart, the way a one-shot write silently was. */
-static int g_calq_mgdl;         /* queued value, mg/dL; 0 = none queued */
-static int g_calq_id;           /* sensor id it is for */
-static long g_calq_t;           /* realtime_s() when the user confirmed it */
-static long g_calq_sent;        /* realtime_s() of the last write attempt; 0 = none */
-static char g_calq_status[28];  /* user-visible outcome line */
-static char g_calq_path[256];   /* persistence file */
+static int g_calq_mgdl;  /* queued value, mg/dL; 0 = none queued */
+static int g_calq_id;    /* sensor id it is for */
+static long g_calq_t;    /* realtime_s() when the user confirmed it */
+static long g_calq_sent; /* realtime_s() of the last write attempt; 0 = none */
+static char g_calq_status[28]; /* user-visible outcome line */
+static char g_calq_path[256];  /* persistence file */
 /* Last RESOLVED calibration, for the per-device LAST CAL row (persisted). */
-static int g_lastcal_mgdl;      /* value of the last resolved calibration */
-static long g_lastcal_t;        /* realtime_s() it resolved; 0 = never */
-static int g_lastcal_ok;        /* 1 = accepted, 0 = failed/rejected */
-static int g_lastcal_id;        /* sensor id it was for */
+static int g_lastcal_mgdl; /* value of the last resolved calibration */
+static long g_lastcal_t;   /* realtime_s() it resolved; 0 = never */
+static int
+    g_lastcal_state;     /* CAL_ST_* (ui.h): applied/rejected/notsup/failed */
+static int g_lastcal_id; /* sensor id it was for */
 /* Give up (visibly, never silently) if the sensor has not accepted within this
  * long -- a fingerstick reference goes stale, so past this we tell the user to
  * re-enter rather than apply an old value or drop it without a word. */
 #define CALQ_WINDOW_S (20L * 60)
+
+/* RESCALE: a persistent multiplicative correction (permille; 1000 = none) the
+ * user sets from a fingerstick. Applied to THIS CGM's readings whose timestamp
+ * is AT OR AFTER the moment rescaling was (re)activated -- so a backfilled
+ * point with an OLDER timestamp is never rescaled even though it arrives later.
+ * The stored/plotted/alarmed glucose is the rescaled value; the raw stays
+ * recoverable via the CSV `rescale` column. Clamped to +-25%. */
+static int g_rescale_pm = 1000; /* active factor; 1000 = off */
+static int g_rescale_id;        /* sensor id it applies to */
+static long g_rescale_t;        /* activation instant; readings t>=this scale */
+static int g_rescale_entry;     /* value awaiting CONFIRM (mg/dL); 0 = none */
+/* PENDING target: a confirmed rescale that could not be computed yet because no
+ * live reading was available. Held (PERSISTED, incl. its request time) until
+ * the next reading for this sensor, then turned into a factor -- never silently
+ * lost, and it survives an app restart. The reading it computes against must be
+ * at most RESCALE_PEND_WINDOW_S newer than the request, or the fingerstick
+ * reference is stale and the pending EXPIRES. */
+static int g_rescale_pend_mgdl; /* target mg/dL awaiting a reading; 0 = none */
+static int g_rescale_pend_id;   /* sensor id it is for */
+static long g_rescale_pend_t;   /* realtime_s() when the user requested it */
+#define RESCALE_PEND_WINDOW_S (15L * 60)
+/* Last attempt exceeded +-25% and was REJECTED (not clamped), or a pending one
+ * EXPIRED. Shown in the RESCALE line until the user sets a valid one or stops.
+ * In-memory only (a transient notice). */
+static int g_rescale_reject;
+static int g_rescale_reject_id;
+static int g_rescale_expired;
+static int g_rescale_expired_id;
+static char g_rescale_path[256]; /* persistence file */
+static int
+    g_link_raw[LINK_MAX];   /* latest RAW (pre-rescale) reading, per link */
+#define RESCALE_MIN_PM 750  /* -25% */
+#define RESCALE_MAX_PM 1250 /* +25% */
+
+/* raw * factor, rounded. */
+static int rescale_apply(int raw, int pm)
+{
+   return (int)((((long)raw * pm) + 500) / 1000);
+}
+
+/* The factor to apply to a reading (src, timestamp t), or 1000 (none). */
+static int rescale_pm_for(int src, long t)
+{
+   if (g_rescale_pm != 1000 && g_rescale_id == src && t >= g_rescale_t)
+      return g_rescale_pm;
+   return 1000;
+}
+
+/* Turn a (target, raw) pair into an active factor for sensor `id`, effective
+ * from `t`. A factor beyond +-25% is REJECTED (not clamped) -- the reading is
+ * too far from the entered value to be a plausible correction -- and flagged
+ * for the RESCALE line. Returns 1 if it activated, 0 if rejected or
+ * uncomputable. */
+static int rescale_activate(int id, int target_mgdl, int raw, long t)
+{
+   if (raw <= 0 || target_mgdl <= 0)
+      return 0;
+   int pm = (int)((((long)target_mgdl * 1000) + (raw / 2)) / raw);
+   if (pm < RESCALE_MIN_PM || pm > RESCALE_MAX_PM) {
+      g_rescale_reject    = 1;
+      g_rescale_reject_id = id;
+      LOGI("rescale REJECTED: %d mg/dL over raw %d -> %d permille exceeds "
+           "+-25%%",
+           target_mgdl, raw, pm);
+      return 0;
+   }
+   g_rescale_pm     = pm;
+   g_rescale_id     = id;
+   g_rescale_t      = t;
+   g_rescale_reject = 0; /* a valid one clears any prior rejection */
+   LOGI("rescale active: %d mg/dL over raw %d -> %d permille (id %d)",
+        target_mgdl, raw, pm, id);
+   return 1;
+}
+
+static void rescale_save(void)
+{
+   int fd = open(g_rescale_path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+   if (fd < 0)
+      return;
+   char b[96];
+   int n = snprintf(b, sizeof b, "%d,%d,%ld,%d,%d,%ld\n", g_rescale_id,
+                    g_rescale_pm, g_rescale_t, g_rescale_pend_id,
+                    g_rescale_pend_mgdl, g_rescale_pend_t);
+   n     = clampn(n, sizeof b);
+   if (write(fd, b, n) < 0) { /* best effort */
+   }
+   close(fd);
+}
+
+static void rescale_load(void)
+{
+   int fd = open(g_rescale_path, O_RDONLY, 0);
+   if (fd < 0)
+      return;
+   char b[96];
+   long n = read(fd, b, (sizeof b) - 1);
+   close(fd);
+   if (n <= 0)
+      return;
+   b[n]      = 0;
+   long v[6] = {0, 0, 0, 0, 0, 0};
+   int vi    = 0;
+   int neg   = 0;
+   for (char *p = b; *p && vi < 6; p++) {
+      if (*p >= '0' && *p <= '9') {
+         v[vi] = (v[vi] * 10) + (*p - '0');
+      } else if (*p == '-') {
+         neg = 1;
+      } else if (*p == ',' || *p == '\n') {
+         if (neg)
+            v[vi] = -v[vi];
+         neg = 0;
+         vi++;
+         if (*p == '\n')
+            break;
+      }
+   }
+   if (v[1] >= RESCALE_MIN_PM && v[1] <= RESCALE_MAX_PM && v[1] != 1000) {
+      g_rescale_id = (int)v[0];
+      g_rescale_pm = (int)v[1];
+      g_rescale_t  = v[2];
+   }
+   if (v[4] > 0) { /* a target was awaiting a reading when we last ran */
+      long pend_t = v[5];
+      /* Restart must NOT lose a pending rescale -- BUT only honour it if its
+       * request is still within the freshness window; a target set before a
+       * long downtime has a stale fingerstick reference and must not silently
+       * apply to a much-later reading. */
+      if (pend_t > 0 && realtime_s() - pend_t <= RESCALE_PEND_WINDOW_S) {
+         g_rescale_pend_id   = (int)v[3];
+         g_rescale_pend_mgdl = (int)v[4];
+         g_rescale_pend_t    = pend_t;
+      } else {
+         g_rescale_expired    = 1; /* surface it, never a silent drop */
+         g_rescale_expired_id = (int)v[3];
+      }
+   }
+}
+
 static void calq_try_locked(void); /* defined after cal_select; used earlier */
 static void calq_tick(void);
 static void calq_load(void);
@@ -350,7 +504,8 @@ static struct meter_rt *meter_rt_get(int id, int create)
    for (int i = 0; i < g_meter_nrt; i++)
       if (g_meter_rt[i].id == id)
          return &g_meter_rt[i];
-   if (create && g_meter_nrt < (int)(sizeof g_meter_rt / sizeof g_meter_rt[0])) {
+   if (create &&
+       g_meter_nrt < (int)(sizeof g_meter_rt / sizeof g_meter_rt[0])) {
       struct meter_rt *r = &g_meter_rt[g_meter_nrt++];
       *r                 = (struct meter_rt){0};
       r->id              = id;
@@ -358,16 +513,17 @@ static struct meter_rt *meter_rt_get(int id, int create)
    }
    return 0;
 }
+
 static char g_meter_mac[24];
 static char g_meter_model[24], g_meter_fw[24];
 static char g_meter_path[256];
 static char g_metersync_path[256]; /* per-meter last-sync time, persisted */
 
-/* Persist every meter's last-sync wall-clock so "LAST SYNC" and the DEVICES-list
- * age survive a restart (rt is otherwise in-memory only and reset to 0 on every
- * launch, which made a fresh install read "OFF / NEVER" for a meter that had in
- * fact synced). Rewrite-and-rename, like meter.idx, so a crash never truncates
- * it to nothing. */
+/* Persist every meter's last-sync wall-clock so "LAST SYNC" and the
+ * DEVICES-list age survive a restart (rt is otherwise in-memory only and reset
+ * to 0 on every launch, which made a fresh install read "OFF / NEVER" for a
+ * meter that had in fact synced). Rewrite-and-rename, like meter.idx, so a
+ * crash never truncates it to nothing. */
 static void meter_sync_save(void)
 {
    char tmp[300];
@@ -381,9 +537,14 @@ static void meter_sync_save(void)
    for (int i = 0; i < g_meter_nrt && ok; i++) {
       if (g_meter_rt[i].sync_t <= 0)
          continue;
-      char b[48];
-      int bn = snprintf(b, sizeof b, "%d,%ld\n", g_meter_rt[i].id,
-                        g_meter_rt[i].sync_t);
+      /* id, last-seen time, and the RSSI captured THEN (so SIGNAL STRENGTH is
+       * the signal AT last-seen, and survives a restart -- it used to be
+       * in-memory only, so a meter read "-- signal" despite a real LAST SEEN).
+       */
+      char b[64];
+      int bn = snprintf(b, sizeof b, "%d,%ld,%d,%d\n", g_meter_rt[i].id,
+                        g_meter_rt[i].sync_t, g_meter_rt[i].rssi,
+                        g_meter_rt[i].rssi_ok);
       bn     = clampn(bn, sizeof b);
       if (write(fd, b, bn) != bn)
          ok = 0;
@@ -410,27 +571,42 @@ static void meter_sync_load(void)
    b[n]    = 0;
    char *p = b;
    while (*p) {
-      long v[2] = {0, 0};
+      long v[4] = {0, 0, 0, 0}; /* id, sync_t, rssi (signed), rssi_ok */
       int vi    = 0;
+      int neg   = 0;
       int any   = 0;
       while (*p && *p != '\n') {
          if (*p >= '0' && *p <= '9') {
             v[vi] = (v[vi] * 10) + (*p - '0');
             any   = 1;
-         } else if (*p == ',' && vi < 1) {
+         } else if (*p == '-') {
+            neg = 1;
+         } else if (*p == ',' && vi < 3) {
+            if (neg)
+               v[vi] = -v[vi];
+            neg = 0;
             vi++;
          }
          p++;
       }
+      if (neg)
+         v[vi] = -v[vi];
       if (*p == '\n')
          p++;
       if (any && v[0] > 0) {
          struct meter_rt *rt = meter_rt_get((int)v[0], 1);
-         if (rt)
+         if (rt) {
             rt->sync_t = v[1];
+            if (v[3]) { /* rssi_ok: the signal at last-seen is known */
+               rt->rssi    = (int)v[2];
+               rt->rssi_ok = 1;
+               rt->rssi_t  = v[1]; /* captured at the last-seen time */
+            }
+         }
       }
    }
 }
+
 /* Which sensor a detail screen is showing (index into g_slot), and the type
  * chosen in the ADD SENSOR flow. */
 static int g_sel      = -1;
@@ -980,8 +1156,8 @@ static void sensor_reconcile(void)
        * this runs once and then stops, rather than re-minting every tick. */
       int stale_row = cr && sensor_kind(cr->type) == KIND_CGM &&
                       (!cr->model[0] || !cr->fw[0]);
-      long act  = cr ? cr->activation : 0;
-      int rtype = cr ? cr->type : SENSOR_STELO;
+      long act      = cr ? cr->activation : 0;
+      int rtype     = cr ? cr->type : SENSOR_STELO;
       sensors_unlock();
       if (!stale_row)
          continue;
@@ -1042,9 +1218,8 @@ static void fill_sensor(struct ui_sensor *u, int i, long now)
    u->marker                  = sl->marker;
    u->color                   = sl->color;
    u->primary                 = sl->primary;
-   u->size                    = (sl->size >= 1 && sl->size <= MARK_SIZE_MAX)
-                                    ? sl->size
-                                    : MARK_SIZE_DEF;
+   u->size =
+       (sl->size >= 1 && sl->size <= MARK_SIZE_MAX) ? sl->size : MARK_SIZE_DEF;
    str_snapshot(u->label, sizeof u->label, sl->label);
    if (sl->have_rec) {
       u->type = sl->type;
@@ -1084,16 +1259,25 @@ static void fill_sensor(struct ui_sensor *u, int i, long now)
       if (g_calq_mgdl > 0 && g_calq_id == u->id) {
          u->cal_pending = g_calq_mgdl;
       } else if (g_lastcal_t > 0 && g_lastcal_id == u->id) {
-         u->cal_mgdl = g_lastcal_mgdl;
-         u->cal_ok   = g_lastcal_ok;
-         u->cal_t    = g_lastcal_t;
+         u->cal_mgdl  = g_lastcal_mgdl;
+         u->cal_state = g_lastcal_state;
+         u->cal_t     = g_lastcal_t;
       }
+      u->rescale_pm =
+          (g_rescale_pm != 1000 && g_rescale_id == u->id) ? g_rescale_pm : 1000;
+      u->rescale_pending =
+          (g_rescale_pend_mgdl > 0 && g_rescale_pend_id == u->id)
+              ? g_rescale_pend_mgdl
+              : 0;
+      u->rescale_rejected = (g_rescale_reject && g_rescale_reject_id == u->id);
+      u->rescale_expired = (g_rescale_expired && g_rescale_expired_id == u->id);
    } else {
       /* PER-METER, so syncing one meter never rewrites another's row. Only the
        * meter that currently OWNS the sync (g_meter_src) shows SYNCING and the
        * live RSSI; each meter's "last" and SYNCED/OFF come from ITS OWN reading
        * history (u->last, set above from g_hist), not the shared session
-       * globals. u->last is persisted, so STATE is correct after a restart too. */
+       * globals. u->last is persisted, so STATE is correct after a restart too.
+       */
       struct meter_rt *rt = meter_rt_get(u->id, 0);
       int syncing         = (g_meter_busy && u->id == g_meter_src);
       u->connected        = syncing;
@@ -1149,6 +1333,10 @@ static void build_model(struct screen *m)
       m->scr = SCR_CAL;
    else if (g_menu == MENU_CALPEND)
       m->scr = SCR_CALPEND;
+   else if (g_menu == MENU_RESCALE)
+      m->scr = SCR_RESCALE;
+   else if (g_menu == MENU_RESCALEACT)
+      m->scr = SCR_RESCALEACT;
    else if (g_menu == MENU_SENSTYPE)
       m->scr = SCR_SENSTYPE;
    else if (g_menu == MENU_FORGET)
@@ -1208,16 +1396,16 @@ static void build_model(struct screen *m)
 
    /* settings + device info (globals persist; s.mac lives on our stack, so it
     * is copied into a static the borrowed pointer can safely outlast) */
-   m->sound_on  = g_sound_on;
-   m->vib_on    = g_vib_on;
-   m->orient    = g_orient;
+   m->sound_on     = g_sound_on;
+   m->vib_on       = g_vib_on;
+   m->orient       = g_orient;
    m->screen_on    = g_screen_on;
    m->newdata_beep = g_newdata_beep;
    m->disc         = g_disc;
    m->code         = g_code_str;
-   m->model     = g_model;
-   m->fw        = g_fw;
-   m->mfr       = g_mfr;
+   m->model        = g_model;
+   m->fw           = g_fw;
+   m->mfr          = g_mfr;
    static char macbuf[20];
    str_snapshot(macbuf, sizeof macbuf, s.mac);
    m->mac = macbuf;
@@ -1249,6 +1437,26 @@ static void build_model(struct screen *m)
    m->cal_last_bg   = c.last_bg;
    m->cal_result    = c.result;
    m->cal_pending   = g_cal_pending;
+
+   /* RESCALE screens. On the confirmation, preview the CLAMPED factor computed
+    * from the entered value over the selected sensor's live raw; on the active
+    * screen, show the running factor. */
+   m->rescale_entry = g_rescale_entry;
+   if (g_menu == MENU_RESCALEACT) {
+      m->rescale_pm = g_rescale_pm;
+   } else if (g_menu == MENU_RESCALE && g_rescale_entry > 0 && g_sel >= 0 &&
+              g_sel < g_nslot) {
+      /* Preview: UNCLAMPED (so a >25% value shows its real size, in red, and is
+       * rejected on CONFIRM), or the sentinel 0 when there is no reading yet to
+       * compute against (the screen then says "ON NEXT READING", not "0%"). */
+      int link = link_for_slot(g_sel);
+      int raw  = (link >= 0 && link < LINK_MAX) ? g_link_raw[link] : 0;
+      m->rescale_pm =
+          (raw > 0) ? (int)((((long)g_rescale_entry * 1000) + (raw / 2)) / raw)
+                    : 0;
+   } else {
+      m->rescale_pm = 1000;
+   }
 
    m->kp_mode = g_kp_mode;
    /* Type being added, for the PAIR NEW <type> / SELECT <type> titles. The
@@ -1582,8 +1790,21 @@ static void jni_on_advert(JNIEnv *env, jclass cls, jstring jname, jstring jmac,
       if (mid > 0 && realtime_s() - mlast > 60) {
          g_meter_src = mid; /* this meter owns the sync that follows */
          if (rt) {
-            rt->sync_t = realtime_s(); /* per-meter last-sync + throttle */
-            meter_sync_save();         /* persist so LAST SYNC survives restart */
+            rt->sync_t = realtime_s(); /* per-meter last-seen + throttle */
+            /* The advertisement IS the "last seen" event, and it carries an
+             * RSSI -- so SIGNAL STRENGTH is stamped here, from the same advert,
+             * not left blank until a connection completes (a meter that
+             * advertised but did not finish a sync used to show LAST SEEN with
+             * a
+             * "--" signal). A completed sync's connection RSSI
+             * (stealo_meter_rssi) refines this afterwards. */
+            if (rssi <= -1 && rssi >= -127) {
+               rt->rssi    = rssi;
+               rt->rssi_ok = 1;
+               rt->rssi_t  = realtime_s();
+            }
+            meter_sync_save(); /* persist so LAST SEEN + signal survive restart
+                                */
          }
          str_snapshot(g_meter_mac, sizeof g_meter_mac, mac);
          g_meter_busy  = 1;
@@ -1833,6 +2054,7 @@ static long g_link_pred_t[LINK_MAX];
  * keeps an unsilenceable alarm from wedging on stale data after a sensor drops
  * out -- the prediction must be current, not a value frozen at disconnect. */
 #define PRED_LOW_MGDL 55
+
 static int any_pred_low(void)
 {
    long now = realtime_s();
@@ -1865,14 +2087,14 @@ static void alarm_apply_ex(int zone, int stale, int stranded, int pred_low)
     * g_alarm_acked is readable here because this runs under alarm_lock. */
    int want = alarm_want_sustained(zone, stale, stranded && !g_alarm_acked,
                                    g_alarm_want);
-   /* IMMINENT HYPO OVERRIDE. A CGM predicting < 55 mg/dL is a forced, UNSILENCE-
-    * ABLE LOW: it outranks every other level, sounds even when the user has the
-    * alarm sound switched off, and cannot be dismissed while the prediction
-    * holds. If the user silenced it (nothing sounding) while it still holds,
-    * clear the remembered level so alarm_decide sees a fresh NONE->LOW edge and
-    * RE-TRIGGERS on the next 1 Hz tick -- that re-trigger is what makes it
-    * unsilenceable. Freshness is enforced in any_pred_low(), so a stale
-    * prediction can never pin this on. */
+   /* IMMINENT HYPO OVERRIDE. A CGM predicting < 55 mg/dL is a forced,
+    * UNSILENCE- ABLE LOW: it outranks every other level, sounds even when the
+    * user has the alarm sound switched off, and cannot be dismissed while the
+    * prediction holds. If the user silenced it (nothing sounding) while it
+    * still holds, clear the remembered level so alarm_decide sees a fresh
+    * NONE->LOW edge and RE-TRIGGERS on the next 1 Hz tick -- that re-trigger is
+    * what makes it unsilenceable. Freshness is enforced in any_pred_low(), so a
+    * stale prediction can never pin this on. */
    if (pred_low) {
       want     = AL_LOW;
       sound_on = 1; /* must be heard regardless of the SOUND setting */
@@ -2273,6 +2495,39 @@ void stealo_glucose(int mg_dl, int trend, int age_s)
       }
       src = g_cur_src;
    }
+   /* RESCALE. Record the RAW value (for computing a future factor), then apply
+    * the active correction IF it belongs to this sensor and this reading's
+    * timestamp is at/after activation. From here mg_dl is the rescaled value,
+    * so history, stats, the alarm and the log all use it; the factor rpm is
+    * written to the log's `rescale` column so the raw stays recoverable. */
+   {
+      int lk = driver_link();
+      if (lk >= 0 && lk < LINK_MAX)
+         g_link_raw[lk] = mg_dl;
+   }
+   /* A rescale target was waiting for a reading to compute its factor: this is
+    * that reading -- BUT only if it is at most RESCALE_PEND_WINDOW_S newer than
+    * the request. Past that the fingerstick reference is stale, so EXPIRE it
+    * (visibly) rather than applying it to a much-later reading. Otherwise
+    * activate from THIS raw, effective from THIS timestamp, so the reference
+    * reading itself shows the entered value. */
+   if (g_rescale_pend_mgdl > 0 && g_rescale_pend_id == src) {
+      if (t - g_rescale_pend_t > RESCALE_PEND_WINDOW_S) {
+         LOGI("pending rescale %d mg/dL EXPIRED (reading %ld s after request)",
+              g_rescale_pend_mgdl, t - g_rescale_pend_t);
+         g_rescale_expired    = 1;
+         g_rescale_expired_id = src;
+      } else {
+         rescale_activate(src, g_rescale_pend_mgdl, mg_dl, t);
+      }
+      g_rescale_pend_mgdl = 0;
+      g_rescale_pend_id   = 0;
+      g_rescale_pend_t    = 0;
+      rescale_save();
+   }
+   int rpm = rescale_pm_for(src, t);
+   if (rpm != 1000)
+      mg_dl = rescale_apply(mg_dl, rpm);
    int prime = sensor_primary_id();
    hist_lock();
    int isnew = hist_insert(t, mg_dl, trend, src, KIND_CGM);
@@ -2302,9 +2557,10 @@ void stealo_glucose(int mg_dl, int trend, int age_s)
          g_link_pred_t[lk] = realtime_s();
       }
    }
-   /* A reading just PROVED this sensor is streaming -- the ideal moment to flush
-    * any queued calibration for it. driver_lock is held (jni_notify) and the
-    * driver is selected to this link, exactly what calq_try_locked needs. */
+   /* A reading just PROVED this sensor is streaming -- the ideal moment to
+    * flush any queued calibration for it. driver_lock is held (jni_notify) and
+    * the driver is selected to this link, exactly what calq_try_locked needs.
+    */
    if (g_calq_mgdl > 0 && src == g_calq_id)
       calq_try_locked();
    /* Persist on HIST_OLD as well: the log is the lifetime record and NHIST is
@@ -2312,7 +2568,7 @@ void stealo_glucose(int mg_dl, int trend, int age_s)
     * touches no draw-shared state. */
    if (isnew)
       store_append(t, mg_dl, trend, g_conn_rssi, has, src, t, g_tz_off,
-                   KIND_CGM);
+                   KIND_CGM, rpm);
    LOGI("glucose %d mg/dL trend %d age %d", mg_dl, trend, age_s);
 
    /* NEW DATAPOINT beep: a genuinely new sample from the PRIMARY CGM only, so a
@@ -2425,14 +2681,14 @@ void stealo_glucose(int mg_dl, int trend, int age_s)
       if (s.have_reading && (long)s.session_seconds > 0 &&
           (long)s.session_seconds < window)
          window = (long)s.session_seconds;
-      long now     = realtime_s();
-      long floor_t = now - window;
+      long now      = realtime_s();
+      long floor_t  = now - window;
       long gap_from = 0; /* older edge of the OLDEST hole within the window */
       hist_lock();
-      long newer = 0; /* previous (newer) sample's time, walking newest->oldest */
+      long newer =
+          0; /* previous (newer) sample's time, walking newest->oldest */
       for (int i = 0; i < g_nhist; i++) {
-         if (g_hist[i].src != (unsigned short)src ||
-             g_hist[i].kind == KIND_BGM)
+         if (g_hist[i].src != (unsigned short)src || g_hist[i].kind == KIND_BGM)
             continue;
          long ts = g_hist[i].t;
          if (ts < floor_t)
@@ -2464,10 +2720,11 @@ void stealo_rssi(int rssi)
    g_conn_rssi   = rssi;
    g_conn_rssi_t = realtime_s();
    /* Latch the CGM's last signal strength the MOMENT it is measured on connect,
-    * exactly like stealo_meter_rssi does for a meter -- not gated behind a fresh
-    * datapoint. Otherwise the Stelo's SIGNAL row drops to "--" whenever readings
-    * lag, while a meter (which latches on connect) keeps showing its last value.
-    * This is a retained "last known" display, so it never expires. */
+    * exactly like stealo_meter_rssi does for a meter -- not gated behind a
+    * fresh datapoint. Otherwise the Stelo's SIGNAL row drops to "--" whenever
+    * readings lag, while a meter (which latches on connect) keeps showing its
+    * last value. This is a retained "last known" display, so it never expires.
+    */
    g_cur_rssi    = rssi;
    g_cur_rssi_ok = 1;
    LOGI("rssi %d dbm", rssi);
@@ -2475,8 +2732,8 @@ void stealo_rssi(int rssi)
 }
 
 /* Meter link RSSI, read once per sync connection (the meter has no continuous
- * link). Stored separately from the CGM RSSI so the meter's SIGNAL row shows its
- * own last-sync strength. */
+ * link). Stored separately from the CGM RSSI so the meter's SIGNAL row shows
+ * its own last-sync strength. */
 void stealo_meter_rssi(int rssi)
 {
    g_meter_rssi    = rssi;
@@ -2600,6 +2857,16 @@ static void sys_set_orientation(int mode)
       return;
    JNIEnv *e = g_act->env;
    (*e)->CallStaticVoidMethod(e, g_ble, m_set_orient, g_act->clazz, (jint)mode);
+}
+
+/* EXPORT DATA: Java builds the combined CSV and opens the system share sheet.
+ */
+static void sys_export_data(void)
+{
+   if (!g_act || !m_export)
+      return;
+   JNIEnv *e = g_act->env;
+   (*e)->CallStaticVoidMethod(e, g_ble, m_export, g_act->clazz);
 }
 
 static int sys_perm_granted(const char *perm)
@@ -2889,8 +3156,8 @@ static void calq_save(void)
    char b[112];
    int n = snprintf(b, sizeof b, "%d,%d,%ld,%d,%ld,%d,%d\n", g_calq_id,
                     g_calq_mgdl, g_calq_t, g_lastcal_mgdl, g_lastcal_t,
-                    g_lastcal_ok, g_lastcal_id);
-   n = clampn(n, sizeof b);
+                    g_lastcal_state, g_lastcal_id);
+   n     = clampn(n, sizeof b);
    if (write(fd, b, n) < 0) { /* best effort: a lost persist only costs a retry
                                  across a restart, never a wrong write */
    }
@@ -2916,16 +3183,16 @@ static void calq_load(void)
    close(fd);
    if (n <= 0)
       return;
-   b[n] = 0;
+   b[n]      = 0;
    long v[7] = {0, 0, 0, 0, 0, 0, 0};
    int vi    = 0;
    int neg   = 0;
    for (char *p = b; *p && vi < 7; p++) {
-      if (*p >= '0' && *p <= '9')
+      if (*p >= '0' && *p <= '9') {
          v[vi] = (v[vi] * 10) + (*p - '0');
-      else if (*p == '-')
+      } else if (*p == '-') {
          neg = 1;
-      else if (*p == ',' || *p == '\n') {
+      } else if (*p == ',' || *p == '\n') {
          if (neg)
             v[vi] = -v[vi];
          neg = 0;
@@ -2935,10 +3202,10 @@ static void calq_load(void)
       }
    }
    /* last-resolved record (fields 4..7) survives regardless of the queue. */
-   g_lastcal_mgdl = (int)v[3];
-   g_lastcal_t    = v[4];
-   g_lastcal_ok   = (int)v[5];
-   g_lastcal_id   = (int)v[6];
+   g_lastcal_mgdl  = (int)v[3];
+   g_lastcal_t     = v[4];
+   g_lastcal_state = (int)v[5];
+   g_lastcal_id    = (int)v[6];
    if (v[1] <= 0)
       return; /* no value queued */
    g_calq_id   = (int)v[0];
@@ -2948,10 +3215,10 @@ static void calq_load(void)
    /* A calibration confirmed before a restart: keep retrying if it is still
     * fresh, otherwise record the failure -- never drop it silently. */
    if (realtime_s() - g_calq_t > CALQ_WINDOW_S) {
-      g_lastcal_mgdl = g_calq_mgdl;
-      g_lastcal_t    = realtime_s();
-      g_lastcal_ok   = 0;
-      g_lastcal_id   = g_calq_id;
+      g_lastcal_mgdl  = g_calq_mgdl;
+      g_lastcal_t     = realtime_s();
+      g_lastcal_state = CAL_ST_FAILED;
+      g_lastcal_id    = g_calq_id;
       (void)snprintf(g_calq_status, sizeof g_calq_status, "LOST - RE-ENTER");
       calq_clear();
    } else {
@@ -2961,12 +3228,58 @@ static void calq_load(void)
 }
 
 /* Attempt the queued calibration NOW. driver_lock must be held and the driver
- * selected to the queued sensor's link (true inside stealo_glucose, which is the
- * ideal moment -- a reading just proved the sensor is streaming). A refusal is
- * not a loss: the value stays queued and the next stream tries again. */
+ * selected to the queued sensor's link (true inside stealo_glucose, which is
+ * the ideal moment -- a reading just proved the sensor is streaming). A refusal
+ * is not a loss: the value stays queued and the next stream tries again. */
 static void calq_try_locked(void)
 {
    if (g_calq_mgdl <= 0)
+      return;
+   struct dex_cal c;
+   driver_get_cal(&c);
+   /* The sensor answered and does NOT permit calibration at all (a factory-
+    * calibrated Stelo, say). Distinct from a value the sensor REJECTS: this is
+    * "the device does not support calibration", so say NOT SUPPORTED. Fail
+    * VISIBLY at once rather than leaving it PENDING until the window lapses.
+    * This only drops the queued value -- it does NOT lock calibration out: a
+    * later user-initiated calibration re-queues and re-probes permission
+    * afresh. */
+   if (c.have && !c.permitted) {
+      LOGI("calibration not permitted by this sensor; queued %d mg/dL not sent",
+           g_calq_mgdl);
+      g_lastcal_mgdl  = g_calq_mgdl;
+      g_lastcal_t     = realtime_s();
+      g_lastcal_state = CAL_ST_NOTSUP;
+      g_lastcal_id    = g_calq_id;
+      (void)snprintf(g_calq_status, sizeof g_calq_status, "NOT SUPPORTED");
+      calq_clear();
+      g_ui_dirty = 1;
+      return;
+   }
+   /* Permission not yet known: PROBE it (0x32). driver_calibrate refuses
+    * without a positive answer, and nothing else sends this probe during
+    * streaming, so the calibration could otherwise never proceed. The write
+    * itself goes on the next stream once the reply sets cal.permitted.
+    *
+    * BE GENTLE with a sensor that may not want calibrations: throttle the probe
+    * to at most once a minute (cal.asked is when we last asked), so a Stelo
+    * that never answers is nudged only a handful of times before the window
+    * lapses and it FAILS -- never hammered. A sensor that answers "no" is
+    * caught by the fast-fail above and never probed again. */
+   if (!c.have) {
+      if (c.asked == 0 || realtime_s() - c.asked >= 60) {
+         driver_cal_bounds();
+         (void)snprintf(g_calq_status, sizeof g_calq_status, "PROBING %d",
+                        g_calq_mgdl);
+         LOGI("calibration queued: probing 0x32 permission before writing");
+      }
+      return;
+   }
+   /* Permitted: send the calibration, but only if we are not already awaiting a
+    * reply from a recent send (calq_tick clears g_calq_sent after 60 s of
+    * silence). One 0x34 per minute at most -- gentle, and the sensor's reply
+    * normally resolves it on the first try. */
+   if (g_calq_sent > 0 && realtime_s() - g_calq_sent < 60)
       return;
    if (driver_calibrate(g_calq_mgdl)) {
       g_calq_sent = realtime_s();
@@ -2988,12 +3301,13 @@ static void calq_tick(void)
       g_calq_sent = 0; /* no reply in a minute: allow another attempt */
    if (now - g_calq_t > CALQ_WINDOW_S) {
       (void)snprintf(g_calq_status, sizeof g_calq_status, "FAILED - RE-ENTER");
-      LOGI("calibration %d mg/dL never accepted within %ld s; giving up VISIBLY",
-           g_calq_mgdl, CALQ_WINDOW_S);
-      g_lastcal_mgdl = g_calq_mgdl;
-      g_lastcal_t    = now;
-      g_lastcal_ok   = 0; /* FAIL */
-      g_lastcal_id   = g_calq_id;
+      LOGI(
+          "calibration %d mg/dL never accepted within %ld s; giving up VISIBLY",
+          g_calq_mgdl, CALQ_WINDOW_S);
+      g_lastcal_mgdl  = g_calq_mgdl;
+      g_lastcal_t     = now;
+      g_lastcal_state = CAL_ST_FAILED;
+      g_lastcal_id    = g_calq_id;
       /* No beep -- LAST CAL shows FAILED; the official app is silent too. */
       calq_clear();
       g_ui_dirty = 1;
@@ -3012,17 +3326,17 @@ void stealo_cal_result(int result)
       LOGI("calibration %d mg/dL ACCEPTED by the sensor", g_calq_mgdl);
       (void)snprintf(g_calq_status, sizeof g_calq_status, "APPLIED %d",
                      g_calq_mgdl);
-      g_lastcal_ok = 1;
+      g_lastcal_state = CAL_ST_APPLIED;
       calq_clear();
    } else {
-      /* The sensor actively rejected the value -- resending it will not help, so
-       * surface it (LAST CAL shows REJECTED) rather than looping or dropping it
-       * silently. No beep: the official app is silent on a rejection too. */
+      /* The sensor actively rejected the value -- resending it will not help,
+       * so surface it (LAST CAL shows REJECTED) rather than looping or dropping
+       * it silently. No beep: the official app is silent on a rejection too. */
       LOGI("calibration %d mg/dL REJECTED by the sensor (result=0x%02x)",
            g_calq_mgdl, result);
       (void)snprintf(g_calq_status, sizeof g_calq_status, "REJECTED %d",
                      g_calq_mgdl);
-      g_lastcal_ok = 0;
+      g_lastcal_state = CAL_ST_REJECTED;
       calq_clear();
    }
    g_ui_dirty = 1;
@@ -3074,7 +3388,16 @@ static void menu_action(int action)
       g_menu = g_sensor_from; /* back to where it was opened from */
       g_sel  = -1;
    } else if (action == MA_ADDSENSOR) {
+      /* The ADD DEVICE type picker shares MA_SENSOR_BACK for its X, so record
+       * where it was opened from -- ONLY on external entry (the DEVICES list in
+       * settings, or a main-screen entry point). METERHELP re-enters this to go
+       * back to the picker and must NOT reset the origin. */
+      if (g_menu == MENU_NONE || g_menu == MENU_SETTINGS)
+         g_sensor_from = g_menu;
       g_menu = MENU_SENSTYPE;
+   } else if (action == MA_EXPORT) {
+      sys_export_data(); /* Java builds the combined CSV + opens the share sheet
+                          */
    } else if (action >= MA_TYPE && action < MA_TYPE + SENSOR_NTYPES) {
       g_add_type = action - MA_TYPE;
       /* A CGM pairs with a code on the keypad; a meter bonds at the OS level,
@@ -3126,8 +3449,8 @@ static void menu_action(int action)
       if (g_sel >= 0 && g_sel < g_nslot) {
          sensors_lock();
          /* cycle 1..MARK_SIZE_MAX */
-         int nx               = g_slot[g_sel].size + 1;
-         g_slot[g_sel].size   = (nx > MARK_SIZE_MAX) ? 1 : nx;
+         int nx             = g_slot[g_sel].size + 1;
+         g_slot[g_sel].size = (nx > MARK_SIZE_MAX) ? 1 : nx;
          slots_save();
          sensors_unlock();
       }
@@ -3256,8 +3579,66 @@ static void menu_action(int action)
       calq_clear();
       g_calq_status[0] = 0;
       g_menu           = MENU_SENSOR;
-   } else if (action == MA_CAL_BACK || action == MA_FORGET_NO) {
-      g_menu = MENU_SENSOR; /* both sub-screens back out to the sensor */
+   } else if (action == MA_RESCALE_OPEN && g_sel >= 0 && g_sel < g_nslot &&
+              ((g_rescale_pm != 1000 && g_rescale_id == g_slot[g_sel].id) ||
+               (g_rescale_pend_mgdl > 0 &&
+                g_rescale_pend_id == g_slot[g_sel].id))) {
+      /* Active OR pending for this sensor: show the active/pending screen
+       * (CHANGE / STOP). */
+      g_menu = MENU_RESCALEACT;
+   } else if (action == MA_RESCALE_OPEN || action == MA_RESCALE_CHANGE) {
+      /* Not active (or explicitly changing): go to the value keypad. */
+      g_menu          = MENU_KEYPAD;
+      g_kp_mode       = 3;
+      g_kp_return     = MENU_SENSOR;
+      g_entrylen      = 0;
+      g_rescale_entry = 0;
+   } else if (action == MA_RESCALE_STOP) {
+      LOGI("rescaling turned OFF by user (was %d permille, pend %d)",
+           g_rescale_pm, g_rescale_pend_mgdl);
+      g_rescale_pm        = 1000;
+      g_rescale_id        = 0;
+      g_rescale_t         = 0;
+      g_rescale_pend_mgdl = 0; /* also discard any pending target */
+      g_rescale_pend_id   = 0;
+      g_rescale_pend_t    = 0;
+      g_rescale_reject    = 0; /* and clear any rejection / expiry notice */
+      g_rescale_expired   = 0;
+      rescale_save();
+      g_menu = MENU_SENSOR;
+   } else if (action == MA_RESCALE_ENTER) {
+      /* CONFIRM: compute the factor from the entered true value over the live
+       * RAW reading, clamp to +-25%, activate for this sensor from NOW. If
+       * there is NO live reading yet, HOLD the target (persisted) -- the next
+       * reading for this sensor computes the factor. It is never silently lost.
+       */
+      if (g_rescale_entry > 0 && g_sel >= 0 && g_sel < g_nslot) {
+         int id   = g_slot[g_sel].id;
+         int link = link_for_slot(g_sel);
+         int raw  = (link >= 0 && link < LINK_MAX) ? g_link_raw[link] : 0;
+         /* A fresh attempt supersedes any prior rejection / expiry notice. */
+         g_rescale_reject  = 0;
+         g_rescale_expired = 0;
+         if (raw > 0) {
+            rescale_activate(id, g_rescale_entry, raw, realtime_s());
+            g_rescale_pend_mgdl = 0;
+            g_rescale_pend_id   = 0;
+            g_rescale_pend_t    = 0;
+         } else {
+            g_rescale_pend_mgdl = g_rescale_entry;
+            g_rescale_pend_id   = id;
+            g_rescale_pend_t    = realtime_s(); /* for the freshness window */
+            LOGI(
+                "rescale %d mg/dL queued: awaiting a reading to compute factor",
+                g_rescale_entry);
+         }
+         rescale_save();
+      }
+      g_rescale_entry = 0;
+      g_menu          = MENU_SENSOR;
+   } else if (action == MA_CAL_BACK || action == MA_FORGET_NO ||
+              action == MA_RESCALE_BACK) {
+      g_menu = MENU_SENSOR; /* these sub-screens back out to the sensor */
    } else if (action == MA_CAL_REFRESH) {
       if (cal_select()) {
          driver_cal_bounds();
@@ -3266,11 +3647,12 @@ static void menu_action(int action)
       }
    } else if (action == MA_CAL_ENTER) {
       /* CONFIRM: QUEUE the calibration durably (persisted), then try once now.
-       * It is NOT dropped if the sensor is not streaming this instant -- it stays
-       * queued and every subsequent reading retries it (see calq_try_locked in
-       * stealo_glucose) until the sensor accepts or the freshness window lapses,
-       * and the outcome is always shown. This is the fix for a confirmed
-       * calibration being silently lost to a reconnect gap. */
+       * It is NOT dropped if the sensor is not streaming this instant -- it
+       * stays queued and every subsequent reading retries it (see
+       * calq_try_locked in stealo_glucose) until the sensor accepts or the
+       * freshness window lapses, and the outcome is always shown. This is the
+       * fix for a confirmed calibration being silently lost to a reconnect gap.
+       */
       if (g_cal_pending > 0 && g_sel >= 0 && g_sel < g_nslot) {
          g_calq_mgdl = g_cal_pending;
          g_calq_id   = g_slot[g_sel].id;
@@ -3279,8 +3661,8 @@ static void menu_action(int action)
          (void)snprintf(g_calq_status, sizeof g_calq_status, "PENDING %d",
                         g_calq_mgdl);
          calq_save();
-         LOGI("calibration QUEUED: %d mg/dL (slot %d, id %d)", g_calq_mgdl, g_sel,
-              g_calq_id);
+         LOGI("calibration QUEUED: %d mg/dL (slot %d, id %d)", g_calq_mgdl,
+              g_sel, g_calq_id);
          if (cal_select()) { /* opportunistic first attempt while we are here */
             calq_try_locked();
             driver_select(LINK_CGM);
@@ -3346,7 +3728,7 @@ static void menu_action(int action)
       else
          keypad_close();
    } /* X -> close */
-   else if (action == 199) {   /* device list: cancel -> back to ADD SENSOR */
+   else if (action == 199) { /* device list: cancel -> back to ADD SENSOR */
       pair_cancel();
       g_menu = MENU_SENSTYPE;
    } else if (action >= 200 &&
@@ -3417,6 +3799,21 @@ static void menu_action(int action)
             keypad_close();
             g_menu = MENU_CAL;
          }
+      } else if (g_kp_mode == 3) { /* RESCALE: a true glucose value (display
+                                      units), like calibration */
+         if (g_entrylen > 0) {
+            int mgdl = cal_entry_mgdl(g_entry, g_entrylen, g_units);
+            if (mgdl < 0) {
+               LOGI("rescale %d mg/dL out of range, not submitted", mgdl);
+               g_entrylen = 0;
+               g_ui_dirty = 1;
+               return; /* stay on the keypad: cleared entry is the feedback */
+            }
+            g_entrylen      = 0;
+            g_rescale_entry = mgdl; /* factor computed on CONFIRM */
+            keypad_close();
+            g_menu = MENU_RESCALE;
+         }
       } else if (g_kp_mode == 1) { /* PLOT MAX: entry is in the display unit */
          if (g_entrylen > 0) {
             int v = 0;
@@ -3451,8 +3848,9 @@ static void menu_action(int action)
             str_snapshot(macbuf, sizeof macbuf, g_devs[idx].mac);
             devlist_unlock();
             commit_pair(macbuf); /* clear winner: pair it */
-         } else
+         } else {
             g_menu = MENU_DEVLIST; /* ambiguous/none: let the user choose */
+         }
       }
    }
    if (g_win)
@@ -3730,9 +4128,9 @@ void ot_drv_status(const char *s)
 {
    set_status(s);
    /* Record the driver's live phase text against the meter that currently owns
-    * the sync, so its per-device STATE row can show a descriptive step ("COUNT",
-    * "READING", "NOTHING NEW") instead of a flat "SYNCING". The "METER: " prefix
-    * is stripped -- the row is already known to be a meter. */
+    * the sync, so its per-device STATE row can show a descriptive step
+    * ("COUNT", "READING", "NOTHING NEW") instead of a flat "SYNCING". The
+    * "METER: " prefix is stripped -- the row is already known to be a meter. */
    struct meter_rt *rt = (g_meter_src > 0) ? meter_rt_get(g_meter_src, 1) : 0;
    if (rt) {
       const char *p = s;
@@ -3741,9 +4139,9 @@ void ot_drv_status(const char *s)
       str_snapshot(rt->stat, sizeof rt->stat, p);
       /* Any driver phase means we CONNECTED to this meter (the first is "HELLO"
        * on connect), so this IS a sync -- stamp LAST SYNC here, not only when a
-       * datapoint or an RSSI read lands. A meter that connects but yields no new
-       * record (e.g. the record read was refused) otherwise stayed "OFF / NEVER"
-       * despite plainly having synced. */
+       * datapoint or an RSSI read lands. A meter that connects but yields no
+       * new record (e.g. the record read was refused) otherwise stayed "OFF /
+       * NEVER" despite plainly having synced. */
       rt->sync_t = realtime_s();
    }
 }
@@ -3778,8 +4176,8 @@ int ot_drv_reading(long naive, int mg_dl)
    hist_lock();
    int isnew = hist_insert(t, mg_dl, 127, g_meter_src, KIND_BGM);
    hist_unlock();
-   if (isnew)
-      store_append(t, mg_dl, 127, 0, 0, g_meter_src, naive, tz, KIND_BGM);
+   if (isnew) /* meters are never rescaled: factor 1000 */
+      store_append(t, mg_dl, 127, 0, 0, g_meter_src, naive, tz, KIND_BGM, 1000);
    LOGI("meter reading %d mg/dL at %ld (raw %ld)%s", mg_dl, t, naive,
         isnew ? "" : " (already stored)");
    g_ui_dirty = 1;
@@ -3839,6 +4237,14 @@ void stealo_backfill(int mg_dl, int trend, int age_s)
       }
       src = g_cur_src; /* single CGM: the global is unambiguous */
    }
+   /* RESCALE, timestamp-gated: a backfilled point is only rescaled if ITS OWN
+    * timestamp is at/after activation. An older buffered point (t < activation)
+    * predates the correction and keeps its raw value -- this is the backfill
+    * care the feature calls for. g_link_raw is NOT touched here: the factor is
+    * computed from the LIVE reading, not a historical one. */
+   int rpm = rescale_pm_for(src, t);
+   if (rpm != 1000)
+      mg_dl = rescale_apply(mg_dl, rpm);
    int prime = sensor_primary_id();
    hist_lock();
    int isnew = hist_insert(t, mg_dl, trend, src, KIND_CGM);
@@ -3847,8 +4253,8 @@ void stealo_backfill(int mg_dl, int trend, int age_s)
    hist_refresh_current(prime);
    hist_unlock();
    if (isnew)
-      store_append(t, mg_dl, trend, 0, 0, src, t, g_tz_off,
-                   KIND_CGM); /* no RSSI for backfilled points */
+      store_append(t, mg_dl, trend, 0, 0, src, t, g_tz_off, KIND_CGM,
+                   rpm); /* no RSSI for backfilled points */
    LOGI("backfill reading %d mg/dL age %d -> t=%ld", mg_dl, age_s, t);
    /* A gap recovered by backfill can be the newest reading (a missed live
     * cycle); re-evaluate the alarm and refresh the notification rather than
@@ -4107,6 +4513,21 @@ static int on_timer(int fd, int events, void *data)
     */
    disc_reeval();
    calq_tick(); /* retry / expire any durably-queued calibration */
+   /* Expire a pending rescale that no reading answered within the window, even
+    * if no datapoint arrives at all (a disconnected CGM). Surfaced, never
+    * dropped. */
+   if (g_rescale_pend_mgdl > 0 &&
+       realtime_s() - g_rescale_pend_t > RESCALE_PEND_WINDOW_S) {
+      LOGI("pending rescale %d mg/dL EXPIRED (no reading within window)",
+           g_rescale_pend_mgdl);
+      g_rescale_expired    = 1;
+      g_rescale_expired_id = g_rescale_pend_id;
+      g_rescale_pend_mgdl  = 0;
+      g_rescale_pend_id    = 0;
+      g_rescale_pend_t     = 0;
+      rescale_save();
+      g_ui_dirty = 1;
+   }
    /* Refresh the UTC offset periodically. It used to be read once in
     * onCreate, but the foreground service is designed to outlive the activity
     * for days -- so across a DST transition every displayed timestamp, and
@@ -4255,8 +4676,16 @@ static int on_input(int fd, int events, void *data)
          if (g_menu) {
             if (action == AMOTION_EVENT_ACTION_DOWN) {
                struct action a = ui_hit(&g_hits, tx, ty);
-               if (a.kind == ACT_MENU)
+               if (a.kind == ACT_MENU) {
                   menu_action(a.arg);
+                  /* GENERAL rule (so no menu needs special-casing): the moment
+                   * a menu action lands back on the MAIN screen, restore its
+                   * chosen orientation -- menus render portrait, main follows
+                   * g_orient. Without this, closing a menu left the main screen
+                   * stuck in the portrait the menu-open had forced. */
+                  if (g_menu == MENU_NONE)
+                     sys_set_orientation(g_orient);
+               }
             }
             AInputQueue_finishEvent(q, ev, 1);
             continue;
@@ -4521,20 +4950,59 @@ static void on_window_resized(struct ANativeActivity *a,
 
 static char g_crash_path[256];
 
+/* Async-signal-safe formatting for the crash logger below: pure, no library
+ * calls, so nothing here is disallowed inside a signal handler. Append a
+ * decimal integer / a bounded string to b[*pos], never past cap. */
+static void crash_putn(char *b, int cap, int *pos, long v)
+{
+   char t[24];
+   int i           = 0;
+   unsigned long u = (v < 0) ? (unsigned long)(-v) : (unsigned long)v;
+   do {
+      t[i++] = (char)('0' + (int)(u % 10U));
+      u /= 10U;
+   } while (u && i < (int)sizeof t);
+   if (v < 0 && *pos < cap)
+      b[(*pos)++] = '-';
+   while (i > 0 && *pos < cap)
+      b[(*pos)++] = t[--i];
+}
+
+static void crash_puts(char *b, int cap, int *pos, const volatile char *s,
+                       int max)
+{
+   for (int i = 0; s && s[i] && i < max && *pos < cap; i++)
+      b[(*pos)++] = s[i];
+}
+
 /* native crash logger: append signal + a little app context, then re-raise so
- * the OS still records its tombstone. Retrieve with run-as cat files/crash.log
- */
+ * the OS still records its tombstone (its tombstone carries the timestamp).
+ * Retrieve with run-as cat files/crash.log.
+ *
+ * Everything here is async-signal-safe: the pure helpers above plus open /
+ * write / close / signal / raise. NO snprintf (locale/heap) and no non-trivial
+ * libc wrappers -- a signal handler may run at any instant, including
+ * mid-malloc. */
 static void crash_handler(int sig)
 {
    char b[200];
-   int n = snprintf(
-       b, sizeof b,
-       "CRASH sig=%d t=%ld where=%.40s status=%.24s glu=%d menu=%d nhist=%d\n",
-       sig, realtime_s(), g_where, g_status, g_cur_glu, g_menu, g_nhist);
-   n      = clampn(n, sizeof b);
+   int p = 0;
+   crash_puts(b, sizeof b, &p, "CRASH sig=", 200);
+   crash_putn(b, sizeof b, &p, sig);
+   crash_puts(b, sizeof b, &p, " where=", 200);
+   crash_puts(b, sizeof b, &p, g_where, 40);
+   crash_puts(b, sizeof b, &p, " status=", 200);
+   crash_puts(b, sizeof b, &p, g_status, 24);
+   crash_puts(b, sizeof b, &p, " glu=", 200);
+   crash_putn(b, sizeof b, &p, g_cur_glu);
+   crash_puts(b, sizeof b, &p, " menu=", 200);
+   crash_putn(b, sizeof b, &p, g_menu);
+   crash_puts(b, sizeof b, &p, " nhist=", 200);
+   crash_putn(b, sizeof b, &p, g_nhist);
+   crash_puts(b, sizeof b, &p, "\n", 200);
    int fd = open(g_crash_path, O_WRONLY | O_CREAT | O_APPEND, 0600);
    if (fd >= 0) {
-      if (write(fd, b, n) != n) {
+      if (write(fd, b, p) != p) {
       }
       close(fd);
    }
@@ -4699,8 +5167,10 @@ ANativeActivity_onCreate(struct ANativeActivity *activity, void *saved,
           (*env)->GetStaticMethodID(env, g_ble, "showGlucose",
                                     "(Landroid/content/Context;Ljava/lang/"
                                     "String;Ljava/lang/String;[III)V");
-      m_set_orient   = (*env)->GetStaticMethodID(env, g_ble, "setOrientation",
-                                                 "(Landroid/content/Context;I)V");
+      m_set_orient = (*env)->GetStaticMethodID(env, g_ble, "setOrientation",
+                                               "(Landroid/content/Context;I)V");
+      m_export     = (*env)->GetStaticMethodID(env, g_ble, "exportData",
+                                               "(Landroid/content/Context;)V");
       m_perm_granted = (*env)->GetStaticMethodID(
           env, g_ble, "permGranted",
           "(Landroid/content/Context;Ljava/lang/String;)Z");
@@ -4760,6 +5230,7 @@ ANativeActivity_onCreate(struct ANativeActivity *activity, void *saved,
          data_path(g_metersync_path, sizeof g_metersync_path, dir,
                    "/meter.sync");
          data_path(g_calq_path, sizeof g_calq_path, dir, "/cal.q");
+         data_path(g_rescale_path, sizeof g_rescale_path, dir, "/rescale.cfg");
          sensors_load(); /* before store_load: readings resolve through it */
          /* Bonded-MAC recovery runs HERE, after sensors_load().
           *
@@ -4829,6 +5300,7 @@ ANativeActivity_onCreate(struct ANativeActivity *activity, void *saved,
          alarm_load();
          settings_load();
          calq_load();       /* resume any durably-queued calibration */
+         rescale_load();    /* restore active rescale factor */
          meter_sync_load(); /* restore per-meter last-sync times */
          code_load();
          sys_set_orientation(g_orient); /* restore last-chosen orientation */
@@ -4836,11 +5308,11 @@ ANativeActivity_onCreate(struct ANativeActivity *activity, void *saved,
          LOGI("reading log: %s (%d in memory, %d stored)", g_store_path,
               g_nhist, g_stored);
          /* store_load restored g_cur_glu/g_cur_time -- the big number shows it
-          * immediately, so the ongoing notification must too. It is dirty-driven
-          * off new readings, which have not arrived yet at cold start, so mark
-          * it dirty here to seed the notification text from the restored
-          * reading rather than leaving it "no recent reading" until the first
-          * live sample. */
+          * immediately, so the ongoing notification must too. It is
+          * dirty-driven off new readings, which have not arrived yet at cold
+          * start, so mark it dirty here to seed the notification text from the
+          * restored reading rather than leaving it "no recent reading" until
+          * the first live sample. */
          if (g_cur_glu >= 0)
             g_notify_dirty = 1;
       }

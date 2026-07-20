@@ -64,10 +64,14 @@ int g_cur_rssi, g_cur_rssi_ok;
 int g_stored;
 char g_store_path[256];
 
-/* Column header for readings.csv, so an exported log is self-describing. */
+/* Column header for readings.csv, so an exported log is self-describing. The
+ * trailing `rescale` column is the multiplicative factor applied to this row's
+ * glucose (e.g. 1.040 = +4%); empty means 1.000 (not rescaled). The stored
+ * glucose is ALREADY rescaled, so the factor is what makes the raw recoverable
+ * (raw = glucose / rescale) -- no data is lost. */
 static const char g_store_hdr[] =
     "# unix_time,glucose_mgdl,trend,rssi,recv_lag_s,sensor_id,"
-    "device_time,tz_offset_s,kind\n";
+    "device_time,tz_offset_s,kind,rescale\n";
 
 void hist_refresh_current(int prime)
 {
@@ -159,7 +163,7 @@ int hist_insert(long t, int glu, int trend, int src, int kind)
 }
 
 void store_append(long t, int glu, int trend, int rssi, int has_rssi, int src,
-                  long raw, long tz, int kind)
+                  long raw, long tz, int kind, int rescale_pm)
 {
    int fd = open(g_store_path, O_WRONLY | O_CREAT | O_APPEND, 0600);
    if (fd < 0)
@@ -168,7 +172,8 @@ void store_append(long t, int glu, int trend, int rssi, int has_rssi, int src,
     * self-describing. Only ever written when the file is empty (never prepended
     * to the existing append-only log); both loaders skip leading-'#' lines. */
    if (lseek(fd, 0, SEEK_END) == 0) {
-      if (write(fd, g_store_hdr, sizeof g_store_hdr - 1) < 0) { /* best effort */
+      if (write(fd, g_store_hdr, sizeof g_store_hdr - 1) <
+          0) { /* best effort */
       }
    }
    /* Where this row starts, so a short write can be undone. O_APPEND makes the
@@ -179,14 +184,24 @@ void store_append(long t, int glu, int trend, int rssi, int has_rssi, int src,
     * Truncating back is the only way to keep the log parseable. */
    long lag = realtime_s() - t; /* arrival delay from the datapoint stamp */
    char line[160];
+   /* Rescale factor column: a decimal (1.040) when this glucose was rescaled,
+    * empty when it was not (1.000). Loaders read positionally through `kind`
+    * and ignore this trailing field, so it is pure provenance. */
+   char rs[12];
+   if (rescale_pm > 0 && rescale_pm != 1000)
+      (void)snprintf(rs, sizeof rs, "%d.%03d", rescale_pm / 1000,
+                     rescale_pm % 1000);
+   else
+      rs[0] = 0;
    /* The file is an ARRIVAL log, never re-sorted -- that is what keeps it
     * append-only and crash-safe. Monotonic order is a property of the sorted
     * in-memory view (see hist_insert), not of the bytes on disk. */
-   int n  = has_rssi
-                ? snprintf(line, sizeof line, "%ld,%d,%d,%d,%ld,%d,%ld,%ld,%d\n",
-                           t, glu, trend, rssi, lag, src, raw, tz, kind)
-                : snprintf(line, sizeof line, "%ld,%d,%d,,%ld,%d,%ld,%ld,%d\n",
-                           t, glu, trend, lag, src, raw, tz, kind);
+   int n =
+       has_rssi
+           ? snprintf(line, sizeof line, "%ld,%d,%d,%d,%ld,%d,%ld,%ld,%d,%s\n",
+                      t, glu, trend, rssi, lag, src, raw, tz, kind, rs)
+           : snprintf(line, sizeof line, "%ld,%d,%d,,%ld,%d,%ld,%ld,%d,%s\n", t,
+                      glu, trend, lag, src, raw, tz, kind, rs);
    n      = clampn(n, sizeof line);
    long w = write(fd, line, n);
    if (w != n) {

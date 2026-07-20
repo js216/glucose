@@ -8,7 +8,9 @@
  * right action. As each screen is ported this harness grows a case per screen.
  * Built and run by `make uitest`. */
 #include "ui.h"
+#include "ndk.h"
 #include "plot.h" /* the capping case asserts plot_render's own mapping */
+#include "sensors.h"
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -39,7 +41,7 @@ static void write_ppm_buf(const struct ANativeWindow_Buffer *b,
    fprintf(f, "P6\n%d %d\n255\n", b->width, b->height);
    for (int i = 0; i < b->width * b->height; i++) {
       uint32_t c         = g_px[i];
-      unsigned char p[3] = {(unsigned char)(c >> 16), (unsigned char)(c >> 8),
+      unsigned char p[3] = {(unsigned char)(c >> 16U), (unsigned char)(c >> 8U),
                             (unsigned char)c};
       fwrite(p, 1, 3, f);
    }
@@ -56,7 +58,7 @@ static void write_ppm(const char *path)
    fprintf(f, "P6\n%d %d\n255\n", W, H);
    for (int i = 0; i < W * H; i++) {
       uint32_t c         = g_px[i];
-      unsigned char b[3] = {(unsigned char)(c >> 16), (unsigned char)(c >> 8),
+      unsigned char b[3] = {(unsigned char)(c >> 16U), (unsigned char)(c >> 8U),
                             (unsigned char)c};
       fwrite(b, 1, 3, f);
    }
@@ -127,29 +129,29 @@ int main(void)
    };
    struct ui_stat s = {.have = 1, .tir = 82, .avg = 149};
    struct screen m  = {
-        .scr             = SCR_MAIN,
-        .now             = 1000,
-        .glu             = 148,
-        .trend           = 2,
-        .t               = 900,
-        .rssi            = -72,
-        .rssi_ok         = 1,
-        .hist            = hist,
-        .nhist           = 4,
-        .scrub           = -1,
-        .plot_hours      = 24,
-        .plot_max        = 300,
-        .bonded          = 1,
-        .have_reading    = 1,
-        .predicted       = 152,
-        .sequence        = 41,
-        .session_seconds = 3L * 86400,
-        .stored          = 812,
-        .units           = 0,
-        .alarm_low       = 100,
-        .alarm_high      = 300,
-        .status          = "CONNECTED",
-        .stat            = {s, s, s, s, s},
+       .scr             = SCR_MAIN,
+       .now             = 1000,
+       .glu             = 148,
+       .trend           = 2,
+       .t               = 900,
+       .rssi            = -72,
+       .rssi_ok         = 1,
+       .hist            = hist,
+       .nhist           = 4,
+       .scrub           = -1,
+       .plot_hours      = 24,
+       .plot_max        = 300,
+       .bonded          = 1,
+       .have_reading    = 1,
+       .predicted       = 152,
+       .sequence        = 41,
+       .session_seconds = 3L * 86400,
+       .stored          = 812,
+       .units           = 0,
+       .alarm_low       = 100,
+       .alarm_high      = 300,
+       .status          = "CONNECTED",
+       .stat            = {s, s, s, s, s},
    };
 
    int fail = 0;
@@ -165,19 +167,36 @@ int main(void)
       printf("  FAIL: main screen rendered almost nothing\n");
       fail = 1;
    }
-   /* a tap on the big number (top band) must open the settings menu */
-   if (ui_hit(&h, W / 4, H / 12).kind != ACT_OPEN_SETTINGS) {
-      printf("  FAIL: big-number tap should be ACT_OPEN_SETTINGS\n");
-      fail = 1;
+   /* Settings now opens ONLY from the hamburger (top-right), not the whole top
+    * band -- so a tap on the number no longer navigates away by accident. The
+    * hamburger's ACT_OPEN_SETTINGS target must exist and be tappable. */
+   {
+      int saw_settings = 0;
+      for (int i = 0; i < h.n; i++)
+         if (h.box[i].kind == ACT_OPEN_SETTINGS) {
+            saw_settings = 1;
+            /* and tapping inside its box resolves to it */
+            if (ui_hit(&h, h.box[i].x + (h.box[i].w / 2),
+                       h.box[i].y + (h.box[i].h / 2))
+                    .kind != ACT_OPEN_SETTINGS)
+               saw_settings = 0;
+         }
+      if (!saw_settings) {
+         printf("  FAIL: no tappable hamburger (ACT_OPEN_SETTINGS) on main\n");
+         fail = 1;
+      }
    }
    /* the tab row, the plot, and the alarm buttons must each be reachable */
-   int saw_tab = 0, saw_scrub = 0, saw_low = 0, saw_high = 0;
+   int saw_tab   = 0;
+   int saw_scrub = 0;
+   int saw_low   = 0;
+   int saw_high  = 0;
    for (int i = 0; i < h.n; i++) {
-      int k = h.box[i].kind;
-      saw_tab |= (k == ACT_PLOT_TAB);
-      saw_scrub |= (k == ACT_SCRUB);
-      saw_low |= (k == ACT_ALARM_LOW);
-      saw_high |= (k == ACT_ALARM_HIGH);
+      int k     = h.box[i].kind;
+      saw_tab   = saw_tab || (k == ACT_PLOT_TAB);
+      saw_scrub = saw_scrub || (k == ACT_SCRUB);
+      saw_low   = saw_low || (k == ACT_ALARM_LOW);
+      saw_high  = saw_high || (k == ACT_ALARM_HIGH);
    }
    if (!(saw_tab && saw_scrub && saw_low && saw_high)) {
       printf("  FAIL: missing targets tab=%d scrub=%d low=%d high=%d\n",
@@ -214,7 +233,7 @@ int main(void)
    {
       int saw_set = 0;
       for (int i = 0; i < h.n; i++)
-         saw_set |= (h.box[i].kind == ACT_OPEN_SETTINGS);
+         saw_set = saw_set || (h.box[i].kind == ACT_OPEN_SETTINGS);
       if (!saw_set) {
          printf("  FAIL: no-reading screen has no way to open settings\n");
          fail = 1;
@@ -250,7 +269,7 @@ int main(void)
    /* at least one actionable row must be recorded */
    int saw_menu = 0;
    for (int i = 0; i < h.n; i++)
-      saw_menu |= (h.box[i].kind == ACT_MENU);
+      saw_menu = saw_menu || (h.box[i].kind == ACT_MENU);
    if (!saw_menu) {
       printf("  FAIL: settings recorded no ACT_MENU targets\n");
       fail = 1;
@@ -317,14 +336,14 @@ int main(void)
    };
    /* A realistic epoch: session start/end rows derive from now, so the toy
     * clock used by the plot cases would render them as pre-1970 nonsense. */
-   const long NOW = 1784358853L; /* 2026-07-18 */
-   set.now        = NOW;
-   sens[0].last   = NOW - 100;
-   sens[1].last   = NOW - 4000;
-   sens[2].last   = NOW - 200000;
-   set.sensors    = sens;
-   set.nsensors   = 3;
-   set.sel        = -1;
+   const long now_ts = 1784358853L; /* 2026-07-18 */
+   set.now           = now_ts;
+   sens[0].last      = now_ts - 100;
+   sens[1].last      = now_ts - 4000;
+   sens[2].last      = now_ts - 200000;
+   set.sensors       = sens;
+   set.nsensors      = 3;
+   set.sel           = -1;
    /* A phone-shaped portrait buffer: the 720x360 test surface is far too short
     * for the sensor list, and asserting on it would test nothing real. */
    struct ANativeWindow_Buffer tall = {
@@ -352,7 +371,8 @@ int main(void)
       }
       int saw_add = 0;
       for (int i = 0; i < h.n; i++)
-         saw_add |= (h.box[i].kind == ACT_MENU && h.box[i].arg == MA_ADDSENSOR);
+         saw_add = saw_add ||
+                   (h.box[i].kind == ACT_MENU && h.box[i].arg == MA_ADDSENSOR);
       if (!saw_add) {
          printf("  FAIL: no ADD NEW SENSOR target\n");
          fail = 1;
@@ -417,11 +437,12 @@ int main(void)
       int nshape = (int)(sizeof shapes / sizeof shapes[0]);
       int nscr   = 0; /* set inside the loop from the array itself */
       for (int i = 0; i < nshape; i++) {
-         int sw = shapes[i][0], sh = shapes[i][1];
+         int sw   = shapes[i][0];
+         int sh   = shapes[i][1];
          int ssc  = ui_settings_scale(sw, sh);
          int scap = ui_sensor_capacity(sw, sh);
          int slh  = 16 * ssc;
-         int need = (sh / 20) + (8 * ssc) + (23 + scap + 1) * slh;
+         int need = (sh / 20) + (8 * ssc) + ((23 + scap + 1) * slh);
          if (scap < UI_MIN_SLOTS || need > sh) {
             printf("  FAIL: %dx%d capacity %d (min %d), needs %d of %d px\n",
                    sw, sh, scap, UI_MIN_SLOTS, need, sh);
@@ -430,7 +451,8 @@ int main(void)
       }
       /* Dense sweep: the two functions must agree at EVERY plausible size, not
        * just at the dozen shapes above -- that is how the 8*sc gap survived. */
-      int swept = 0, swbad = 0;
+      int swept                 = 0;
+      int swbad                 = 0;
       static const int widths[] = {480, 540, 600,  640,  720,  768,
                                    828, 900, 1080, 1200, 1242, 1440};
       for (unsigned wi = 0; wi < sizeof widths / sizeof widths[0]; wi++) {
@@ -439,7 +461,7 @@ int main(void)
             int ssc  = ui_settings_scale(sw, sh);
             int scap = ui_sensor_capacity(sw, sh);
             int need =
-                (sh / 20) + (8 * ssc) + (UI_SET_ABOVE + scap + 1) * 16 * ssc;
+                (sh / 20) + (8 * ssc) + ((UI_SET_ABOVE + scap + 1) * 16 * ssc);
             swept++;
             if (scap < UI_MIN_SLOTS || need > sh) {
                if (!swbad)
@@ -470,7 +492,8 @@ int main(void)
       rs.predicted = 152;
       rs.sequence  = 41;
       for (int i = 0; i < nshape; i++) {
-         int sw = shapes[i][0], sh = shapes[i][1];
+         int sw                         = shapes[i][0];
+         int sh                         = shapes[i][1];
          struct ANativeWindow_Buffer rb = {.width  = sw,
                                            .height = sh,
                                            .stride = sw,
@@ -493,8 +516,8 @@ int main(void)
             rr.cal_status    = 2;
             rr.cal_last_bg   = 142;
             rr.cal_result    = 0;
-            rr.now           = NOW;
-            rr.t             = NOW - 100;
+            rr.now           = now_ts;
+            rr.t             = now_ts - 100;
             /* A FULL sensor list, not one row.
              *
              * This swept nsensors = 1, so the settings screen -- the only
@@ -562,8 +585,8 @@ int main(void)
          }
          /* Essential controls must EXIST (not merely be in bounds). */
          struct screen rm   = m;
-         rm.now             = NOW;
-         rm.t               = NOW - 100;
+         rm.now             = now_ts;
+         rm.t               = now_ts - 100;
          rm.session_seconds = 16L * 86400;
          rm.sensors         = &rs;
          rm.nsensors        = 1;
@@ -576,7 +599,7 @@ int main(void)
          }
          int saw_pair = 0;
          for (int k = 0; k < h.n; k++)
-            saw_pair |= (h.box[k].kind == ACT_PAIR_NEW);
+            saw_pair = saw_pair || (h.box[k].kind == ACT_PAIR_NEW);
          if (!saw_pair) {
             printf("  FAIL: %dx%d: expired sensor has no PAIR NEW target\n", sw,
                    sh);
@@ -587,7 +610,7 @@ int main(void)
           * to pair a sensor -- and it was only ever rendered at one size. */
          struct screen nr = {.scr       = SCR_MAIN,
                              .glu       = -1,
-                             .now       = NOW,
+                             .now       = now_ts,
                              .status    = "SCANNING",
                              .adv_total = 137,
                              .devs      = devs,
@@ -607,7 +630,7 @@ int main(void)
                          sh);
                   fail = 1;
                }
-               ok_set |= (h.box[k].kind == ACT_OPEN_SETTINGS);
+               ok_set = ok_set || (h.box[k].kind == ACT_OPEN_SETTINGS);
             }
             if (!ok_set) {
                printf("  FAIL: %dx%d no-reading: cannot reach settings\n", sw,
@@ -621,8 +644,8 @@ int main(void)
           * row the budget was sized for. The harness set .bonded = 1 and never
           * cleared it, so this row was never laid out anywhere. */
          struct screen ub = m;
-         ub.now           = NOW;
-         ub.t             = NOW - 100;
+         ub.now           = now_ts;
+         ub.t             = now_ts - 100;
          ub.bonded        = 0;
          ub.status        = "METER: REGISTER FAILED";
          ub.adv_total     = 1482137;
@@ -638,8 +661,8 @@ int main(void)
           * used mg/dL, so the wider units label ("MMOL/L", 6 chars vs 5) was
           * never exercised -- and it is exactly what overflowed the row. */
          struct screen mm = m;
-         mm.now           = NOW;
-         mm.t             = NOW - 100;
+         mm.now           = now_ts;
+         mm.t             = now_ts - 100;
          mm.units         = 1;
          ui_clip_reset();
          ui_render(&rb, &mm, &h);
@@ -650,8 +673,8 @@ int main(void)
          }
          /* The LOW banner and the stats table must actually be VISIBLE. */
          struct screen lo = m;
-         lo.now           = NOW;
-         lo.t             = NOW - 100;
+         lo.now           = now_ts;
+         lo.t             = now_ts - 100;
          lo.glu = 45; /* below 50: the big number turns red, so a shared
                        * colour would make the banner check meaningless */
          lo.alarm_low       = 100;
@@ -767,12 +790,13 @@ int main(void)
             if (hh.box[i].kind != ACT_MENU || hh.box[i].w <= 0 ||
                 hh.box[i].h <= 0)
                continue;
-            int cx            = hh.box[i].x + hh.box[i].w / 2;
-            int cy            = hh.box[i].y + hh.box[i].h / 2;
+            int cx            = hh.box[i].x + (hh.box[i].w / 2);
+            int cy            = hh.box[i].y + (hh.box[i].h / 2);
             struct action got = ui_hit(&hh, cx, cy);
             checked++;
             /* The last box covering the point wins, so compare against that. */
-            int want_arg = -1, want_kind = -1;
+            int want_arg  = -1;
+            int want_kind = -1;
             for (int k = hh.n - 1; k >= 0; k--)
                if (cx >= hh.box[k].x && cx < hh.box[k].x + hh.box[k].w &&
                    cy >= hh.box[k].y && cy < hh.box[k].y + hh.box[k].h) {
@@ -851,7 +875,10 @@ int main(void)
                                             .format = 1,
                                             .bits   = g_px};
          ui_render(&fb2, &fm, &fh);
-         int nyes = 0, nno = 0, ymin_yes = 1 << 30, ymax_no = -1;
+         int nyes     = 0;
+         int nno      = 0;
+         int ymin_yes = 1073741824; /* 1<<30: a y past any real coordinate */
+         int ymax_no  = -1;
          for (int i = 0; i < fh.n; i++) {
             if (fh.box[i].kind != ACT_MENU)
                continue;
@@ -939,7 +966,8 @@ int main(void)
              * device. Rows are drawn strongest-RSSI first, so walking them top
              * to bottom must give the MODEL indices in RSSI order -- here
              * 1 (-55), 2 (-70), 0 (-90). */
-            int rows[3], nr = 0;
+            int rows[3];
+            int nr = 0;
             for (int i = 0; i < vh.n && nr < 3; i++)
                if (vh.box[i].kind == ACT_MENU && vh.box[i].arg >= MA_DEV_PICK &&
                    vh.box[i].arg < MA_DEV_PICK + 3)
@@ -989,7 +1017,8 @@ int main(void)
          ui_render(&kb2, &km2, &kh2);
          static const int want[12] = {107, 108, 109, 104, 105, 106,
                                       101, 102, 103, 100, 110, MA_OK};
-         int idx[64], n = 0;
+         int idx[64];
+         int n = 0;
          for (int i = 0; i < kh2.n && n < 64; i++)
             /* Keys only: MA_DIGIT(100..109), MA_BACKSPACE(110) and MA_OK(111).
              * MA_KP_CLOSE(113) is the close band, not part of the grid. */
@@ -999,8 +1028,10 @@ int main(void)
          /* Sort the collected targets into reading order (row, then column). */
          for (int a = 0; a < n; a++)
             for (int b = a + 1; b < n; b++) {
-               int ia = idx[a], ib = idx[b];
-               int rowa = kh2.box[ia].y, rowb = kh2.box[ib].y;
+               int ia   = idx[a];
+               int ib   = idx[b];
+               int rowa = kh2.box[ia].y;
+               int rowb = kh2.box[ib].y;
                if (rowb < rowa - 4 ||
                    (rowb < rowa + 4 && kh2.box[ib].x < kh2.box[ia].x)) {
                   int t  = idx[a];
@@ -1102,8 +1133,8 @@ int main(void)
                continue;
             }
             /* And a tap at its centre must actually dispatch to it. */
-            int cx            = eh.box[found].x + eh.box[found].w / 2;
-            int cy            = eh.box[found].y + eh.box[found].h / 2;
+            int cx            = eh.box[found].x + (eh.box[found].w / 2);
+            int cy            = eh.box[found].y + (eh.box[found].h / 2);
             struct action got = ui_hit(&eh, cx, cy);
             if (got.kind != ACT_MENU || got.arg != esc[e].esc) {
                printf("  FAIL: %s escape at (%d,%d) dispatches kind=%d arg=%d, "
@@ -1126,13 +1157,23 @@ int main(void)
     * the axis labels actually explain. Asserted through plot_point_xy so this
     * checks plot_render's own mapping rather than a re-derivation of it. */
    {
-      const int px0 = 0, py0 = 0, pw = 100, ph = 60;
+      const int px0 = 0;
+      const int py0 = 0;
+      const int pw  = 100;
+      const int ph  = 60;
       plot_set_max(300);
       struct plot_pt at_max = {.t = 0, .glu = 300};
       struct plot_pt over   = {.t = 0, .glu = 900};
       struct plot_pt at_min = {.t = 0, .glu = 50};
       struct plot_pt under  = {.t = 0, .glu = 10};
-      int ax, ay, ox, oy, nx, ny, ux, uy;
+      int ax                = 0;
+      int ay                = 0;
+      int ox                = 0;
+      int oy                = 0;
+      int nx                = 0;
+      int ny                = 0;
+      int ux                = 0;
+      int uy                = 0;
       plot_point_xy(px0, py0, pw, ph, at_max, 0, 1, &ax, &ay);
       plot_point_xy(px0, py0, pw, ph, over, 0, 1, &ox, &oy);
       plot_point_xy(px0, py0, pw, ph, at_min, 0, 1, &nx, &ny);
@@ -1155,28 +1196,28 @@ int main(void)
     * -- was dead code as far as the offline tests were concerned. */
    {
       struct ui_point mh[8] = {
-          {.t   = NOW - 100,
+          {.t   = now_ts - 100,
            .glu = 148,
-           .src = 1                                }, /* primary CGM: value palette */
-          {.t   = NOW - 300,
+           .src = 1                                   }, /* primary CGM: value palette */
+          {.t   = now_ts - 300,
            .glu = 143,
-           .src = 2                                }, /* 2nd CGM: own colour+square */
-          {.t   = NOW - 600,
+           .src = 2                                   }, /* 2nd CGM: own colour+square */
+          {.t   = now_ts - 600,
            .glu = 205,
-           .src = 3                                }, /* meter: own colour+triangle */
-          {.t   = NOW - 900,
+           .src = 3                                   }, /* meter: own colour+triangle */
+          {.t   = now_ts - 900,
            .glu = 132,
-           .src = 99                               }, /* forgotten sensor: orphan */
-          {.t = NOW - 1200,   .glu = 155, .src = 1 },
-          {.t = NOW - 1500,   .glu = 121, .src = 2 },
-          {.t = NOW - 1800,   .glu = 178, .src = 99},
-          {.t   = NOW - 2100,
+           .src = 99                                  }, /* forgotten sensor: orphan */
+          {.t = now_ts - 1200,   .glu = 155, .src = 1 },
+          {.t = now_ts - 1500,   .glu = 121, .src = 2 },
+          {.t = now_ts - 1800,   .glu = 178, .src = 99},
+          {.t   = now_ts - 2100,
            .glu = 160,
-           .src = 0                                }, /* legacy: also value palette */
+           .src = 0                                   }, /* legacy: also value palette */
       };
       struct screen ms = m;
-      ms.now           = NOW;
-      ms.t             = NOW - 100;
+      ms.now           = now_ts;
+      ms.t             = now_ts - 100;
       ms.hist          = mh;
       ms.nhist         = 8;
       ms.sensors       = sens;
@@ -1217,21 +1258,25 @@ int main(void)
    ui_render(&tall, &det, &h);
    write_ppm_buf(&tall, "tmp/uitest/sensor.ppm");
    {
-      int saw_primary = 0, saw_marker = 0, saw_color = 0, saw_cal = 0,
-          saw_forget = 0;
+      /* Marker shape, COLOUR and SIZE were combined into ONE picker opened from
+       * the MARKER row, so the per-sensor screen no longer has a separate COLOR
+       * target -- MA_MARKER is the single affordance for all three. */
+      int saw_primary = 0;
+      int saw_marker  = 0;
+      int saw_cal     = 0;
+      int saw_forget  = 0;
       for (int i = 0; i < h.n; i++) {
          if (h.box[i].kind != ACT_MENU)
             continue;
-         saw_primary |= (h.box[i].arg == MA_PRIMARY);
-         saw_marker |= (h.box[i].arg == MA_MARKER);
-         saw_color |= (h.box[i].arg == MA_COLOR);
-         saw_cal |= (h.box[i].arg == MA_CAL_OPEN);
-         saw_forget |= (h.box[i].arg == MA_FORGET);
+         saw_primary = saw_primary || (h.box[i].arg == MA_PRIMARY);
+         saw_marker  = saw_marker || (h.box[i].arg == MA_MARKER);
+         saw_cal     = saw_cal || (h.box[i].arg == MA_CAL_OPEN);
+         saw_forget  = saw_forget || (h.box[i].arg == MA_FORGET);
       }
-      if (!(saw_primary && saw_marker && saw_color && saw_cal && saw_forget)) {
-         printf("  FAIL: sensor screen targets pri=%d mark=%d col=%d cal=%d "
+      if (!(saw_primary && saw_marker && saw_cal && saw_forget)) {
+         printf("  FAIL: sensor screen targets pri=%d mark=%d cal=%d "
                 "forget=%d\n",
-                saw_primary, saw_marker, saw_color, saw_cal, saw_forget);
+                saw_primary, saw_marker, saw_cal, saw_forget);
          fail = 1;
       }
    }
@@ -1239,13 +1284,15 @@ int main(void)
    det.sel = 2;
    ui_render(&tall, &det, &h);
    {
-      int saw_sync = 0, saw_cal = 0, saw_primary = 0;
+      int saw_sync    = 0;
+      int saw_cal     = 0;
+      int saw_primary = 0;
       for (int i = 0; i < h.n; i++) {
          if (h.box[i].kind != ACT_MENU)
             continue;
-         saw_sync |= (h.box[i].arg == MA_SYNC);
-         saw_cal |= (h.box[i].arg == MA_CAL_OPEN);
-         saw_primary |= (h.box[i].arg == MA_PRIMARY);
+         saw_sync    = saw_sync || (h.box[i].arg == MA_SYNC);
+         saw_cal     = saw_cal || (h.box[i].arg == MA_CAL_OPEN);
+         saw_primary = saw_primary || (h.box[i].arg == MA_PRIMARY);
       }
       if (!saw_sync || saw_cal || saw_primary) {
          printf("  FAIL: meter screen sync=%d cal=%d primary=%d "
@@ -1262,12 +1309,13 @@ int main(void)
    ui_render(&tall, &fg, &h);
    write_ppm_buf(&tall, "tmp/uitest/forget.ppm");
    {
-      int saw_yes = 0, saw_no = 0;
+      int saw_yes = 0;
+      int saw_no  = 0;
       for (int i = 0; i < h.n; i++) {
          if (h.box[i].kind != ACT_MENU)
             continue;
-         saw_yes |= (h.box[i].arg == MA_FORGET_YES);
-         saw_no |= (h.box[i].arg == MA_FORGET_NO);
+         saw_yes = saw_yes || (h.box[i].arg == MA_FORGET_YES);
+         saw_no  = saw_no || (h.box[i].arg == MA_FORGET_NO);
       }
       if (!saw_yes || !saw_no) {
          printf("  FAIL: forget confirm yes=%d no=%d\n", saw_yes, saw_no);
@@ -1305,15 +1353,17 @@ int main(void)
    ui_render(&tall, &lb, &h);
    write_ppm_buf(&tall, "tmp/uitest/label.ppm");
    {
-      int chars = 0, saw_del = 0, saw_ok = 0;
+      int chars   = 0;
+      int saw_del = 0;
+      int saw_ok  = 0;
       for (int i = 0; i < h.n; i++) {
          if (h.box[i].kind != ACT_MENU)
             continue;
          if (h.box[i].arg >= MA_CHAR &&
              h.box[i].arg < MA_CHAR + ui_label_nchars())
             chars++;
-         saw_del |= (h.box[i].arg == MA_BACKSPACE);
-         saw_ok |= (h.box[i].arg == 111);
+         saw_del = saw_del || (h.box[i].arg == MA_BACKSPACE);
+         saw_ok  = saw_ok || (h.box[i].arg == 111);
       }
       if (chars != ui_label_nchars() || !saw_del || !saw_ok) {
          printf("  FAIL: rename keypad chars=%d/%d del=%d ok=%d\n", chars,
@@ -1322,36 +1372,28 @@ int main(void)
       }
    }
 
-   /* --- calibration panel: blocked unless the firmware permits it --- */
+   /* --- calibration CONFIRMATION screen: the value keypad's OK lands here and
+    * it always offers CONFIRM + CANCEL. Permission is no longer a UI gate: an
+    * unsupported sensor is handled by the durable calibration queue (which
+    * surfaces NOT SUPPORTED), so SCR_CAL just confirms the typed value. */
    struct screen cal = set;
    cal.scr           = SCR_CAL;
    cal.sel           = 0;
-   cal.cal_have      = 1;
-   cal.cal_permitted = 0;
-   cal.cal_result    = -1;
-   ui_render(&tall, &cal, &h);
-   {
-      int saw_enter = 0;
-      for (int i = 0; i < h.n; i++)
-         saw_enter |=
-             (h.box[i].kind == ACT_MENU && h.box[i].arg == MA_CAL_ENTER);
-      if (saw_enter) {
-         printf("  FAIL: ENTER VALUE tappable while not permitted\n");
-         fail = 1;
-      }
-   }
-   cal.cal_permitted = 1;
-   cal.cal_status    = 1;
-   cal.cal_last_bg   = 140;
+   cal.cal_pending = 140; /* the value typed on the keypad, awaiting CONFIRM */
    ui_render(&tall, &cal, &h);
    write_ppm_buf(&tall, "tmp/uitest/cal.ppm");
    {
-      int saw_enter = 0;
-      for (int i = 0; i < h.n; i++)
-         saw_enter |=
-             (h.box[i].kind == ACT_MENU && h.box[i].arg == MA_CAL_ENTER);
-      if (!saw_enter) {
-         printf("  FAIL: ENTER VALUE not tappable while permitted\n");
+      int saw_enter  = 0;
+      int saw_cancel = 0;
+      for (int i = 0; i < h.n; i++) {
+         if (h.box[i].kind != ACT_MENU)
+            continue;
+         saw_enter  = saw_enter || (h.box[i].arg == MA_CAL_ENTER);
+         saw_cancel = saw_cancel || (h.box[i].arg == MA_CAL_BACK);
+      }
+      if (!saw_enter || !saw_cancel) {
+         printf("  FAIL: cal confirm screen enter=%d cancel=%d\n", saw_enter,
+                saw_cancel);
          fail = 1;
       }
    }
@@ -1379,7 +1421,7 @@ int main(void)
    write_ppm("tmp/uitest/gate.ppm");
    int saw_cont = 0;
    for (int i = 0; i < h.n; i++)
-      saw_cont |= (h.box[i].kind == ACT_GATE_CONTINUE);
+      saw_cont = saw_cont || (h.box[i].kind == ACT_GATE_CONTINUE);
    if (!saw_cont) {
       printf("  FAIL: gate recorded no ACT_GATE_CONTINUE target\n");
       fail = 1;

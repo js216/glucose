@@ -20,7 +20,6 @@
  */
 #include "sensors.h"
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
@@ -73,13 +72,18 @@ int main(void)
    ck(again3 == a,
       "...even with a different activation (it is not in the key)");
 
-   printf("== any change in the identifying fields mints a NEW id ==\n");
+   printf("== identity is (type, address); learned attributes are NOT ==\n");
+   /* model/fw/serial are LEARNED ATTRIBUTES of a device, not its identity.
+    * Keying on them split one physical device across ids the instant its DIS
+    * was read AFTER its first reading, orphaning every reading logged between
+    * -- so the same (type, address) must return the SAME id regardless of them.
+    */
    int fw2 =
        sensor_mint(SENSOR_STELO, "AA:BB:CC:DD:EE:01", "", "SW1", "1.1", 100);
-   ck(fw2 != a && fw2 > 0, "a firmware change is a different identity");
+   ck(fw2 == a, "a firmware change keeps the SAME id (it is not identity)");
    int mac2 =
        sensor_mint(SENSOR_STELO, "AA:BB:CC:DD:EE:02", "", "SW1", "1.0", 100);
-   ck(mac2 != a && mac2 != fw2, "a different address is a different identity");
+   ck(mac2 != a, "a different address is a different identity");
    int type2 =
        sensor_mint(SENSOR_G7, "AA:BB:CC:DD:EE:01", "", "SW1", "1.0", 100);
    ck(type2 != a, "a different type is a different identity");
@@ -169,14 +173,19 @@ int main(void)
       "...but its PROVENANCE row remains, so old readings still resolve");
 
    printf("== rebind moves a slot to a new id, keeping its preferences ==\n");
+   /* Completing the DIS strings no longer mints a new id (identity is the MAC),
+    * so the bare->DIS re-mint that USED to drive a rebind is gone -- that was
+    * the orphan bug. The rebind MECHANISM is still live in production (a slot
+    * whose device is re-resolved to another id, e.g. legacy data that carried
+    * two ids for one address), so it is exercised here with two distinct ids.
+    */
    fresh();
    int r1 = sensor_mint(SENSOR_STELO, "33:33:33:33:33:33", "", "", "", 100);
    int ri = sensor_claim_slot(r1, SENSOR_STELO, "33:33:33:33:33:33");
    g_slot[ri].marker = 2;
    g_slot[ri].color  = 3;
-   int r2 =
-       sensor_mint(SENSOR_STELO, "33:33:33:33:33:33", "", "SW", "1.2", 100);
-   ck(r2 != r1, "completing the DIS strings mints a new id");
+   int r2 = sensor_mint(SENSOR_STELO, "44:44:44:44:44:44", "", "", "", 100);
+   ck(r2 != r1 && r2 > 0, "a distinct device yields a distinct id");
    ck(sensor_rebind_slot(r1, r2) == 1, "the slot rebinds to it");
    ck(g_slot[ri].id == r2, "...pointing at the new id");
    ck(g_slot[ri].marker == 2 && g_slot[ri].color == 3,
