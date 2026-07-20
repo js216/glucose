@@ -315,7 +315,15 @@ int plot_hit(int x, int y, int w, int h, const struct plot_pt *pts, int npts,
       long ddx = t_to_x(dt, x, w, span) - tx;
       if (ddx < 0)
          ddx = -ddx;
-      if (best < 0 || ddx < bestd) {
+      /* `<=`, not `<`, so an EQUAL-distance tie resolves to the later-iterated
+       * point. pts is newest-first, so that is the OLDER of the two. On a
+       * multi-day span many 5-minute samples share one pixel column (a 7D plot
+       * is ~15 min per pixel), and with a strict `<` the far-left drag could
+       * never reach the true oldest sample -- the scrub stuck one or two
+       * samples in from the edge and appeared to "evict" the oldest point as
+       * newer data arrived. Preferring the older sample on a tie makes a drag
+       * to the left edge land on the actual leftmost point that is drawn. */
+      if (best < 0 || ddx <= bestd) {
          best  = i;
          bestd = ddx;
       }

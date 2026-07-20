@@ -2,7 +2,7 @@
 // dexble.c --- BLE transport: JNI glue between Ble.java and the driver
 // Copyright 2026 Jakob Kastelic
 
-/* stealo BLE transport: the thin JNI layer between the Ble.java dumb pipe and
+/* pancra BLE transport: the thin JNI layer between the Ble.java dumb pipe and
  * the transport-agnostic protocol driver (dexdriver.c). It implements the drv_*
  * hooks via Ble's static methods and forwards Ble's callbacks into the driver.
  *
@@ -15,13 +15,13 @@
 #include "dexdriver.h"
 #include "dexlibc.h"
 #include "otble.h"
-#include "stealo.h"
+#include "pancra.h"
 #include <jni.h>
 #include <jni_md.h>
 #include <stdint.h>
 
 int __android_log_print(int prio, const char *tag, const char *fmt, ...);
-#define LOGI(...) __android_log_print(4, "stealo", __VA_ARGS__)
+#define LOGI(...) __android_log_print(4, "pancra", __VA_ARGS__)
 
 static jclass g_ble;
 static jobject g_ctx;
@@ -50,7 +50,7 @@ static const char *link_path(char *out, int cap, const char *base, int link)
 }
 
 static JavaVM *g_vm;       /* for a JNIEnv on any thread */
-static jclass g_alarm_cls; /* com.jk.stealo.Alarm */
+static jclass g_alarm_cls; /* com.jk.pancra.Alarm */
 static jmethodID m_alarm_trigger, m_alarm_silence, m_alarm_beep;
 
 /* a JNIEnv valid on the calling thread (main-loop touches and binder callbacks
@@ -172,11 +172,11 @@ void drv_connect(const char *mac)
    (*e)->DeleteLocalRef(e, m);
    if (err) {
       /* GetStringUTFChars can itself return NULL on OOM; s then flows into
-       * LOGI("%s") and stealo_status -> NULL deref. */
+       * LOGI("%s") and pancra_status -> NULL deref. */
       const char *s = (*e)->GetStringUTFChars(e, err, 0);
       if (s) {
          LOGI("connect: %s", s);
-         stealo_status(s);
+         pancra_status(s);
          (*e)->ReleaseStringUTFChars(e, err, s);
       }
       (*e)->DeleteLocalRef(e, err);
@@ -262,7 +262,7 @@ void dexble_link_close(int link)
 
 void drv_status(const char *s)
 {
-   stealo_status(s);
+   pancra_status(s);
 }
 
 static void ble_read_rssi(void)
@@ -317,17 +317,17 @@ void dexble_request_devinfo(void)
 
 void drv_glucose(int mg, int trend, int age)
 {
-   stealo_glucose(mg, trend, age);
+   pancra_glucose(mg, trend, age);
 }
 
 void drv_cal_result(int result)
 {
-   stealo_cal_result(result);
+   pancra_cal_result(result);
 }
 
 void drv_backfill(int mg, int trend, int age)
 {
-   stealo_backfill(mg, trend, age);
+   pancra_backfill(mg, trend, age);
 }
 
 int drv_key_load(uint8_t key[16])
@@ -413,7 +413,7 @@ static void jni_connected(JNIEnv *e, jclass c, jint link)
       /* Sample the meter's link RSSI now -- it is only connected during a sync,
        * so this brief window is the one chance. Read LINK_METER explicitly
        * (ble_read_rssi() targets driver_link(), which is not the meter here);
-       * the result returns via onRssi -> jni_rssi -> stealo_meter_rssi. */
+       * the result returns via onRssi -> jni_rssi -> pancra_meter_rssi. */
       if (e && m_readrssi)
          (*e)->CallStaticVoidMethod(e, g_ble, m_readrssi, (jint)LINK_METER);
    } else {
@@ -496,7 +496,7 @@ static void jni_notify(JNIEnv *e, jclass c, jint link, jstring ju,
     * a hypo would be decoded and logged with no sound, no vibration, and no
     * way to silence one already ringing. Alarms must not depend on a visible
     * activity. */
-   stealo_alarm_check();
+   pancra_alarm_check();
    (*e)->ReleaseStringUTFChars(e, ju, u);
 }
 
@@ -508,17 +508,17 @@ static void jni_tick(JNIEnv *e, jclass c)
 {
    (void)e;
    (void)c;
-   stealo_alarm_check();
+   pancra_alarm_check();
    /* Keep the lock-screen notification tracking readings too: it is the only
     * glucose display left once the activity is gone. */
-   stealo_notify_refresh();
+   pancra_notify_refresh();
    /* Also repair stranded links. on_timer does this too, but on_timer lives on
     * the ACTIVITY's looper and dies with it, while this service tick is
     * designed to outlive the activity by days -- which is exactly the window
     * in which a stranded link would otherwise never be reconnected. */
-   stealo_link_watchdog();
+   pancra_link_watchdog();
    meter_sync_watchdog();
-   stealo_reconcile_tick();
+   pancra_reconcile_tick();
 }
 
 static void jni_rssi(JNIEnv *e, jclass c, jint link, jint rssi)
@@ -526,9 +526,9 @@ static void jni_rssi(JNIEnv *e, jclass c, jint link, jint rssi)
    (void)e;
    (void)c;
    if (link != LINK_METER)
-      stealo_rssi(rssi);
+      pancra_rssi(rssi);
    else
-      stealo_meter_rssi(rssi); /* meter's last-sync signal strength */
+      pancra_meter_rssi(rssi); /* meter's last-sync signal strength */
 }
 
 static void jni_read(JNIEnv *e, jclass c, jint link, jstring ju, jbyteArray jd)
@@ -547,7 +547,7 @@ static void jni_read(JNIEnv *e, jclass c, jint link, jstring ju, jbyteArray jd)
    if (n > 0)
       (*e)->GetByteArrayRegion(e, jd, 0, n, (jbyte *)buf);
    buf[n < 0 ? 0 : n] = 0;
-   stealo_devinfo(link, u, buf);
+   pancra_devinfo(link, u, buf);
    (*e)->ReleaseStringUTFChars(e, ju, u);
 }
 

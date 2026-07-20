@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0
-// StealoFiles.java --- a tiny read-only ContentProvider for EXPORT DATA
+// PancraFiles.java --- a tiny read-only ContentProvider for EXPORT DATA
 // Copyright 2026 Jakob Kastelic
 
 /* A file:// URI to a private file cannot be shared on modern Android
@@ -8,7 +8,7 @@
  * (Gradle-free, platform-only) build does not carry -- so this is a minimal
  * hand-written provider instead. It serves ONLY the two exported CSVs, read
  * only, by exact name (no path traversal). */
-package com.jk.stealo;
+package com.jk.pancra;
 
 import android.content.ContentProvider;
 import android.content.ContentValues;
@@ -21,9 +21,9 @@ import android.provider.OpenableColumns;
 import java.io.File;
 import java.io.FileNotFoundException;
 
-public class StealoFiles extends ContentProvider {
+public class PancraFiles extends ContentProvider {
     /* The exact set of files that may be handed out. Anything else -> denied. */
-    private static final String[] ALLOWED = { "stealo.csv" };
+    private static final String[] ALLOWED = { "pancra.csv" };
 
     private static boolean allowed(String name) {
         if (name == null) return false;

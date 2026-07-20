@@ -3,7 +3,7 @@
 // Copyright 2026 Juggluco and xDrip contributors
 
 /* Dexcom G7 / Stelo authentication -- public C API. Self-contained (portable
- * SHA-256 / AES-128 / P-256; no external crypto lib). See NOTES.md. */
+ * SHA-256 / AES-128 / P-256; no external crypto lib). */
 #ifndef DEXAUTH_H
 #define DEXAUTH_H
 

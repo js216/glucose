@@ -2,7 +2,7 @@
 // dexdriver.h --- Dexcom protocol driver (API + transport hooks)
 // Copyright 2026 Jakob Kastelic
 
-/* stealo protocol driver: the Dexcom pairing/reconnect state machine, with NO
+/* pancra protocol driver: the Dexcom pairing/reconnect state machine, with NO
  * Android/JNI dependency. The transport (BLE writes/subscribes) and UI/storage
  * are provided by the host via the drv_* hooks below -- implemented by dexble.c
  * on the phone and by a mock harness in the offline tests. */
@@ -14,7 +14,7 @@
  * queue in Ble.java, and its own driver context -- so a slow or stalled sensor
  * cannot hold up another one's advertising window, and two sensors sharing a
  * GATT layout (Stelo and G7 do) never trample each other's state. Defined here
- * rather than in stealo.h so the protocol layer stays free of JNI. */
+ * rather than in pancra.h so the protocol layer stays free of JNI. */
 #define LINK_CGM   0 /* first Dexcom sensor */
 #define LINK_METER 1 /* OneTouch meter */
 #define LINK_CGM2  2 /* a second Dexcom sensor, streaming concurrently */

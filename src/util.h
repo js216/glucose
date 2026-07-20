@@ -2,8 +2,8 @@
 // util.h --- Small dependency-free time/format helpers
 // Copyright 2026 Jakob Kastelic
 
-#ifndef STEALO_UTIL_H
-#define STEALO_UTIL_H
+#ifndef PANCRA_UTIL_H
+#define PANCRA_UTIL_H
 
 long long now_ms(void); /* CLOCK_MONOTONIC milliseconds */
 long realtime_s(void);  /* CLOCK_REALTIME seconds (epoch) */

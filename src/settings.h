@@ -2,8 +2,8 @@
 // settings.h --- Persisted config: alarms, display prefs, device info, code
 // Copyright 2026 Jakob Kastelic
 
-#ifndef STEALO_SETTINGS_H
-#define STEALO_SETTINGS_H
+#ifndef PANCRA_SETTINGS_H
+#define PANCRA_SETTINGS_H
 
 /* Config state owned by settings.c and persisted to small files. The UI reads
  * these for display and writes them from the settings menu, then calls the

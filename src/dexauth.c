@@ -6,7 +6,7 @@
  *
  * Algorithm ported from Juggluco (GPLv3) and xDrip's jamorham.keks; validated
  * against their vectors AND a real Stelo pairing capture. This file is GPLv3.
- * Curve secp256r1 (P-256), SHA-256. See NOTES.md for the protocol.
+ * Curve secp256r1 (P-256), SHA-256.
  *
  * Offline test build:
  *   cc -DDEXAUTH_TEST dexauth.c p256.c sha256.c aes.c -o t && ./t

@@ -19,8 +19,8 @@
  * recycling an id would silently reattribute old data to a different physical
  * device. Forgetting a sensor drops its slot; the provenance row stays.
  */
-#ifndef STEALO_SENSORS_H
-#define STEALO_SENSORS_H
+#ifndef PANCRA_SENSORS_H
+#define PANCRA_SENSORS_H
 
 #define MAX_SLOTS 5 /* user-visible sensors; the UI shrinks this to fit */
 /* In-memory tail of sensors.csv. Only sensors with points in the plot window

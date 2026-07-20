@@ -3,8 +3,8 @@
 // Copyright 2026 Jakob Kastelic
 
 /* Minimal freestanding <time.h> shim (see string.h for the rationale). */
-#ifndef STEALO_TIME_H
-#define STEALO_TIME_H
+#ifndef PANCRA_TIME_H
+#define PANCRA_TIME_H
 
 struct timespec {
    long tv_sec, tv_nsec;

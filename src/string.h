@@ -6,8 +6,8 @@
  * headers, and the host glibc <string.h> won't compile freestanding; -Isrc
  * makes this the header that satisfies <string.h> for the functions we use.
  * The phone's real bionic binds the definitions at runtime (see stub_c.c). */
-#ifndef STEALO_STRING_H
-#define STEALO_STRING_H
+#ifndef PANCRA_STRING_H
+#define PANCRA_STRING_H
 
 #include <stddef.h>
 

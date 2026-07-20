@@ -2,7 +2,7 @@
 // dexdata.h --- Dexcom glucose decoding (API)
 // Copyright 2026 Juggluco and xDrip contributors
 
-/* Dexcom G7 / Stelo glucose decoding -- public C API. See NOTES.md. */
+/* Dexcom G7 / Stelo glucose decoding -- public C API. */
 #ifndef DEXDATA_H
 #define DEXDATA_H
 

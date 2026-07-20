@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!-- SPDX-License-Identifier: GPL-3.0 -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
-          package="com.jk.stealo"
+          package="com.jk.pancra"
           android:versionCode="1" android:versionName="1.0">
   <uses-sdk android:minSdkVersion="29" android:targetSdkVersion="34"/>
 
@@ -28,25 +28,25 @@
   <!-- debuggable is intentionally absent (defaults to false = release-safe).
        Dev builds flip it on via aapt's debug-mode flag so crash.log is
        retrievable on-device; `make release` does not. -->
-  <application android:label="Stealo"
+  <application android:label="Pancra"
                android:icon="@mipmap/ic_launcher"
                android:roundIcon="@mipmap/ic_launcher_round"
                android:allowBackup="false"
                android:theme="@android:style/Theme.NoTitleBar">
     <activity android:name="android.app.NativeActivity" android:exported="true"
               android:configChanges="orientation|screenSize|screenLayout|keyboardHidden">
-      <meta-data android:name="android.app.lib_name" android:value="stealo"/>
+      <meta-data android:name="android.app.lib_name" android:value="pancra"/>
       <intent-filter>
         <action android:name="android.intent.action.MAIN"/>
         <category android:name="android.intent.category.LAUNCHER"/>
       </intent-filter>
     </activity>
-    <service android:name=".StealoService"
+    <service android:name=".PancraService"
              android:foregroundServiceType="connectedDevice"
              android:exported="false"/>
     <!-- serves the exported CSVs as content:// URIs for the EXPORT DATA share -->
-    <provider android:name=".StealoFiles"
-              android:authorities="com.jk.stealo.files"
+    <provider android:name=".PancraFiles"
+              android:authorities="com.jk.pancra.files"
               android:exported="false"
               android:grantUriPermissions="true"/>
   </application>

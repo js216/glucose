@@ -2,7 +2,7 @@
 // main.c --- Native app core: UI rendering, state, and JNI wiring
 // Copyright 2026 Jakob Kastelic
 
-/* stealo native core, plain C -- no NDK glue.
+/* pancra native core, plain C -- no NDK glue.
  * Implements ANativeActivity_onCreate directly; links against stub
  * libc/libandroid/liblog (stub_*.c) -- the phone binds the real bionic ones.
  * jni.h comes from the host JDK (same ABI as Android's).
@@ -17,12 +17,12 @@
 #include "dexlibc.h"
 #include "ndk.h"
 #include "otble.h"
+#include "pancra.h"
 #include "plot.h"
 #include "scanlogic.h"
 #include "sensors.h"
 #include "settings.h"
 #include "stats.h"
-#include "stealo.h"
 #include "store.h"
 #include "ui.h"
 #include "util.h"
@@ -37,7 +37,7 @@
 #include <time.h>
 
 int __android_log_print(int prio, const char *tag, const char *fmt, ...);
-#define LOGI(...) __android_log_print(4, "stealo", __VA_ARGS__)
+#define LOGI(...) __android_log_print(4, "pancra", __VA_ARGS__)
 
 /* ---- app configuration constants (tunables collected here) ---- */
 #define MAX_LINES 16 /* text lines on the pre-reading status screen */
@@ -156,7 +156,7 @@ static long g_scan_hold_until;
 /* A stop_scan that Java could not confirm; the 1 Hz timer retries it. Without
  * this, g_scanning latches at 1 with no live scan behind it. */
 static int g_scan_stop_pending;
-static jclass g_ble; /* global ref to com.jk.stealo.Ble */
+static jclass g_ble; /* global ref to com.jk.pancra.Ble */
 static jmethodID g_scan, g_stop;
 static jmethodID m_set_orient, m_perm_granted, m_req_perm,
     m_open_settings; /* settings-menu ops */
@@ -185,7 +185,7 @@ static int g_nlines;
 /* Last connect attempt per link, so a burst of adverts yields one connect. */
 static long g_link_try[LINK_MAX];
 
-/* dexble transport prototypes come from stealo.h; driver_* from dexdriver.h */
+/* dexble transport prototypes come from pancra.h; driver_* from dexdriver.h */
 
 /* reading history + current-reading snapshot live in store.c (see store.h) */
 static long g_tz_off;     /* local timezone offset, seconds */
@@ -254,7 +254,7 @@ static const int disc_min[] = {0, 10, 30, 60}; /* DISCONNECT-alarm minutes */
 static long g_launch_t; /* for the stale-alarm grace period */
 /* Per-CGM-link DIS strings. g_model/g_fw (settings.c) are process-global and
  * shared by every link, which is fine for the headline display but WRONG for
- * provenance -- see stealo_devinfo. Minting uses these. */
+ * provenance -- see pancra_devinfo. Minting uses these. */
 static char g_model_l[LINK_MAX][24], g_fw_l[LINK_MAX][24];
 static int g_disc_alarmed; /* stale alarm currently latched */
 
@@ -894,7 +894,7 @@ static int src_for_link(int link)
     * selection and the work following it must be one atomic step. Two of the
     * three callers reach here from inside jni_notify, which already holds the
     * (recursive) lock, which is why the omission was invisible. The third,
-    * stealo_link_watchdog, runs on the main looper AND the service tick thread
+    * pancra_link_watchdog, runs on the main looper AND the service tick thread
     * and calls this AFTER releasing it -- so it can stomp g_cur_link and ctx
     * out from under a binder thread mid-dispatch. That thread then attributes
     * its reading to the OTHER sensor's id in the append-only log, and
@@ -1066,7 +1066,7 @@ static void sensor_reconcile(void)
           * would inherit the first's model and firmware permanently.
           *
           * Copied under the registry lock, for the reason spelled out in the
-          * second pass below: stealo_devinfo fills these byte-by-byte from a
+          * second pass below: pancra_devinfo fills these byte-by-byte from a
           * binder thread, and a torn read here is minted into an append-only
           * row that is never rewritten. */
          char amodel[24] = {0};
@@ -1125,7 +1125,7 @@ static void sensor_reconcile(void)
          continue;
       sensors_lock();
       /* COPY the DIS strings under the registry lock -- the same lock
-       * stealo_devinfo writes them under, on a binder thread, while this runs
+       * pancra_devinfo writes them under, on a binder thread, while this runs
        * on the main thread. Testing and snapshotting them unlocked (as this
        * did) made that writer's lock inert: the emptiness test passes as soon
        * as the writer lands byte 0, so a firmware of "1.6.0.11" can be read as
@@ -1199,7 +1199,7 @@ static void sensor_reconcile(void)
  * fallback source id in a log that is never rewritten. meter_sync_watchdog was
  * lifted out for exactly this reason; the rest of the function was left
  * behind. */
-void stealo_reconcile_tick(void)
+void pancra_reconcile_tick(void)
 {
    sensor_reconcile();
 }
@@ -1509,7 +1509,7 @@ static void draw_impl(struct ANativeWindow *win);
 
 /* draw() is called from the main looper (on_timer at 1 Hz, on_input) AND from
  * BLE binder threads (status/reading updates flow through set_status/
- * stealo_glucose -> draw). struct ANativeWindow (a BufferQueue producer) is NOT
+ * pancra_glucose -> draw). struct ANativeWindow (a BufferQueue producer) is NOT
  * safe for concurrent access: two threads locking the surface at once corrupts
  * the returned buffer and segfaults. Serialise with a lock-free guard -- if a
  * draw is already running on another thread, drop this frame; the 1 Hz timer
@@ -1586,7 +1586,7 @@ static void update_screen(void)
     * a bound so this read can never scan off the end during a racing write. */
    char st[MAX_COLS + 1];
    str_snapshot(st, sizeof st, g_status);
-   (void)snprintf(next[n++], sizeof next[0], "STEALO  %s", st);
+   (void)snprintf(next[n++], sizeof next[0], "PANCRA  %s", st);
    /* total rounded to 10s so ambient chatter doesn't redraw every advert.
     * g_ndevs is written by the binder-thread advert handler under devlist_lock,
     * so snapshot it under the same lock -- honouring the invariant every other
@@ -1797,7 +1797,7 @@ static void jni_on_advert(JNIEnv *env, jclass cls, jstring jname, jstring jmac,
              * advertised but did not finish a sync used to show LAST SEEN with
              * a
              * "--" signal). A completed sync's connection RSSI
-             * (stealo_meter_rssi) refines this afterwards. */
+             * (pancra_meter_rssi) refines this afterwards. */
             if (rssi <= -1 && rssi >= -127) {
                rt->rssi    = rssi;
                rt->rssi_ok = 1;
@@ -1820,7 +1820,7 @@ static void jni_on_advert(JNIEnv *env, jclass cls, jstring jname, jstring jmac,
           * link, and a sync that finishes before the reads land (the common
           * case -- "nothing new" ends after one round trip) would otherwise
           * mint this meter against the PREVIOUS meter's model and firmware. */
-         sensors_lock(); /* the lock stealo_devinfo writes these under */
+         sensors_lock(); /* the lock pancra_devinfo writes these under */
          g_meter_model[0] = 0;
          g_meter_fw[0]    = 0;
          sensors_unlock();
@@ -1944,7 +1944,7 @@ static void request_ble_permissions(struct ANativeActivity *a)
 
 /* FindClass inside struct ANativeActivity callbacks resolves via the
  * framework's class loader, which can't see app classes; go through the
- * activity's own loader instead. Takes a dotted name ("com.jk.stealo.Ble"). */
+ * activity's own loader instead. Takes a dotted name ("com.jk.pancra.Ble"). */
 static jclass find_app_class(struct ANativeActivity *a, const char *name)
 {
    JNIEnv *env       = a->env;
@@ -1987,7 +1987,7 @@ static void set_status(const char *s)
  * a lock here is unnecessary. The real callers are:
  *   - the main looper: disc_reeval() on the 1 Hz timer, alarm_reeval() from a
  *     threshold tap, and the tap-to-silence path in on_input;
- *   - a GATT binder thread: jni_notify calls stealo_alarm_check AFTER
+ *   - a GATT binder thread: jni_notify calls pancra_alarm_check AFTER
  *     releasing driver_lock (which is the property that actually matters --
  *     raising an alarm does blocking MediaPlayer work, and doing that under a
  *     no-timeout spin lock the main looper also takes is what must not happen);
@@ -2044,7 +2044,7 @@ static int g_alarm_want;
 static int g_alarm_acked;
 
 /* Most recent PREDICTED value (mg/dL) and its wall-clock, per CGM link. Written
- * in stealo_glucose as each reading is decoded (driver_lock held there); read
+ * in pancra_glucose as each reading is decoded (driver_lock held there); read
  * in the alarm evaluation. Plain aligned int/long, single-writer per link. */
 static int g_link_pred[LINK_MAX];
 static long g_link_pred_t[LINK_MAX];
@@ -2251,7 +2251,7 @@ static void alarm_reactuate(void)
 {
    /* Clear AND re-evaluate under ONE hold. Releasing between them left a
     * window in which a binder thread or the service tick could run
-    * stealo_alarm_check, re-commit the same g_alarm_want, and make the
+    * pancra_alarm_check, re-commit the same g_alarm_want, and make the
     * re-evaluation early-return on `want == g_alarm_want` -- silently losing
     * the re-actuation, which is precisely the failure this function exists to
     * prevent. alarm_lock is recursive, so nesting is free.
@@ -2336,7 +2336,7 @@ void meter_sync_watchdog(void)
    }
 }
 
-void stealo_link_watchdog(void)
+void pancra_link_watchdog(void)
 {
    static long last_kick[LINK_MAX];
    long now = realtime_s();
@@ -2387,7 +2387,7 @@ void stealo_link_watchdog(void)
    }
 }
 
-void stealo_alarm_check(void)
+void pancra_alarm_check(void)
 {
    struct alarm_reading cur = current_reading();
    long now                 = realtime_s();
@@ -2416,11 +2416,11 @@ static void disc_reeval(void)
     * The zone is recomputed here so it DECAYS with time -- this path runs when
     * no readings are arriving, which is exactly when a stale zone would
     * otherwise mask the disconnect alarm. */
-   stealo_alarm_check();
+   pancra_alarm_check();
 }
 
 /* --- hooks called by the BLE driver (dexble.c) --- */
-void stealo_status(const char *s)
+void pancra_status(const char *s)
 {
    set_status(s);
 }
@@ -2441,9 +2441,9 @@ static int glucose_plausible(int mg_dl)
 }
 
 /* current reading from the 4e stream */
-void stealo_glucose(int mg_dl, int trend, int age_s)
+void pancra_glucose(int mg_dl, int trend, int age_s)
 {
-   g_where = "stealo_glucose";
+   g_where = "pancra_glucose";
    if (!glucose_plausible(mg_dl)) {
       LOGI("glucose %d mg/dL implausible, ignored", mg_dl);
       return;
@@ -2715,12 +2715,12 @@ void stealo_glucose(int mg_dl, int trend, int age_s)
 
 /* live connection signal strength from readRemoteRssi (no sensor-battery cost)
  */
-void stealo_rssi(int rssi)
+void pancra_rssi(int rssi)
 {
    g_conn_rssi   = rssi;
    g_conn_rssi_t = realtime_s();
    /* Latch the CGM's last signal strength the MOMENT it is measured on connect,
-    * exactly like stealo_meter_rssi does for a meter -- not gated behind a
+    * exactly like pancra_meter_rssi does for a meter -- not gated behind a
     * fresh datapoint. Otherwise the Stelo's SIGNAL row drops to "--" whenever
     * readings lag, while a meter (which latches on connect) keeps showing its
     * last value. This is a retained "last known" display, so it never expires.
@@ -2734,7 +2734,7 @@ void stealo_rssi(int rssi)
 /* Meter link RSSI, read once per sync connection (the meter has no continuous
  * link). Stored separately from the CGM RSSI so the meter's SIGNAL row shows
  * its own last-sync strength. */
-void stealo_meter_rssi(int rssi)
+void pancra_meter_rssi(int rssi)
 {
    g_meter_rssi    = rssi;
    g_meter_rssi_ok = 1;
@@ -2781,7 +2781,7 @@ static void devinfo_copy(char *dst, const char *src)
 }
 
 /* device-info string (serial / firmware / software) read from DIS 0x180A */
-void stealo_devinfo(int link, const char *uuid, const char *val)
+void pancra_devinfo(int link, const char *uuid, const char *val)
 {
    if (!val || !val[0] || !uuid)
       return;
@@ -3054,7 +3054,7 @@ static void commit_pair(const char *mac)
       driver_lock();
       ot_init(meter_index_load(id));
       driver_unlock();
-      sensors_lock(); /* the lock stealo_devinfo writes these under */
+      sensors_lock(); /* the lock pancra_devinfo writes these under */
       g_meter_model[0] = 0;
       g_meter_fw[0]    = 0;
       sensors_unlock();
@@ -3103,7 +3103,7 @@ static void commit_pair(const char *mac)
 
 /* Apply the SCREEN setting. FLAG_KEEP_SCREEN_ON is what overrides the display
  * timeout while the app is open; clearing it hands the screen back to the OS.
- * Only the window flag changes -- the BLE wakelock in StealoService is
+ * Only the window flag changes -- the BLE wakelock in PancraService is
  * separate, so readings keep arriving either way. */
 static void apply_screen_on(void)
 {
@@ -3228,7 +3228,7 @@ static void calq_load(void)
 }
 
 /* Attempt the queued calibration NOW. driver_lock must be held and the driver
- * selected to the queued sensor's link (true inside stealo_glucose, which is
+ * selected to the queued sensor's link (true inside pancra_glucose, which is
  * the ideal moment -- a reading just proved the sensor is streaming). A refusal
  * is not a loss: the value stays queued and the next stream tries again. */
 static void calq_try_locked(void)
@@ -3315,7 +3315,7 @@ static void calq_tick(void)
 }
 
 /* Driver callback: the sensor answered a calibration we sent. */
-void stealo_cal_result(int result)
+void pancra_cal_result(int result)
 {
    if (g_calq_mgdl <= 0)
       return; /* unsolicited / already resolved */
@@ -3649,7 +3649,7 @@ static void menu_action(int action)
       /* CONFIRM: QUEUE the calibration durably (persisted), then try once now.
        * It is NOT dropped if the sensor is not streaming this instant -- it
        * stays queued and every subsequent reading retries it (see
-       * calq_try_locked in stealo_glucose) until the sensor accepts or the
+       * calq_try_locked in pancra_glucose) until the sensor accepts or the
        * freshness window lapses, and the outcome is always shown. This is the
        * fix for a confirmed calibration being silently lost to a reconnect gap.
        */
@@ -3879,7 +3879,7 @@ static void alarm_adjust(int i)
    /* Clamp logic lives in alarmlogic.c so `make check` can fail on it.
     *
     * Under alarm_lock because the thresholds are READ under it by
-    * stealo_alarm_check (alarm_zone and alarm_stranded both take them), from a
+    * pancra_alarm_check (alarm_zone and alarm_stranded both take them), from a
     * binder thread and the service tick. Writing them unlocked let an
     * evaluation observe a mixed pair -- a new low against an old high -- which
     * for one tick can invert the range and report the wrong zone. */
@@ -4220,7 +4220,7 @@ void ot_drv_done(int new_records)
    g_ui_dirty = 1;
 }
 
-void stealo_backfill(int mg_dl, int trend, int age_s)
+void pancra_backfill(int mg_dl, int trend, int age_s)
 {
    if (!glucose_plausible(mg_dl)) {
       LOGI("backfill %d mg/dL implausible, ignored", mg_dl);
@@ -4259,7 +4259,7 @@ void stealo_backfill(int mg_dl, int trend, int age_s)
    /* A gap recovered by backfill can be the newest reading (a missed live
     * cycle); re-evaluate the alarm and refresh the notification rather than
     * waiting for the next live reading. Rendering is on the 1 Hz timer. */
-   /* Alarm left to the 1 Hz main-thread path -- see stealo_glucose. */
+   /* Alarm left to the 1 Hz main-thread path -- see pancra_glucose. */
    g_ui_dirty     = 1;
    g_notify_dirty = 1;
 }
@@ -4483,8 +4483,8 @@ static void notify_update(void)
  * every 20 s tick would re-render the plot bitmap and re-post the notification
  * when nothing had changed -- pure battery and CPU cost on a 24/7 app, for a
  * display that only moves when a reading lands. g_notify_dirty is set by
- * stealo_glucose, so this fires within one tick of each new reading. */
-void stealo_notify_refresh(void)
+ * pancra_glucose, so this fires within one tick of each new reading. */
+void pancra_notify_refresh(void)
 {
    if (!__atomic_exchange_n(&g_notify_dirty, 0, __ATOMIC_SEQ_CST))
       return;
@@ -4581,7 +4581,7 @@ static int on_timer(int fd, int events, void *data)
          start_scan(g_act);
       }
    }
-   stealo_link_watchdog();
+   pancra_link_watchdog();
    /* Same atomic test-and-clear the service path uses: whichever consumer
     * wins renders it, and the other does not double-render. */
    if (__atomic_exchange_n(&g_notify_dirty, 0, __ATOMIC_SEQ_CST))
@@ -5140,7 +5140,7 @@ ANativeActivity_onCreate(struct ANativeActivity *activity, void *saved,
     * relaunch re-enters onCreate in the same process -- guard this so we don't
     * leak the g_ble global ref, re-register natives, or reload the history. */
    if (!g_inited) {
-      jclass ble = find_app_class(activity, "com.jk.stealo.Ble");
+      jclass ble = find_app_class(activity, "com.jk.pancra.Ble");
       if (!ble) {
          LOGI("Ble class NOT found");
          set_status("NO BLE CLASS!");
@@ -5208,11 +5208,11 @@ ANativeActivity_onCreate(struct ANativeActivity *activity, void *saved,
        * not choose. */
       /* Alarm class must come through the app's own classloader (see
        * find_app_class) */
-      dexble_set_alarm(env, find_app_class(activity, "com.jk.stealo.Alarm"));
+      dexble_set_alarm(env, find_app_class(activity, "com.jk.pancra.Alarm"));
 
       /* persistent reading log: remember our own datapoints across restarts.
        * Internal storage; the app is debuggable, so retrieve with
-       *   adb shell run-as com.jk.stealo cat files/readings.csv > readings.csv
+       *   adb shell run-as com.jk.pancra cat files/readings.csv > readings.csv
        */
       {
          const char *dir = activity->internalDataPath

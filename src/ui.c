@@ -921,12 +921,12 @@ static void render_noreading(struct ANativeWindow_Buffer *fb,
     * pairing flow were unreachable by touch. A sensor needing a 4-digit
     * applicator code could never be added. */
    add_hit(h, 0, y - (2 * sc), fb->width, 14 * sc, ACT_OPEN_SETTINGS, 0);
-   /* "STEALO  " + a UI_COLS-long status needs more than UI_COLS+1. The
+   /* "PANCRA  " + a UI_COLS-long status needs more than UI_COLS+1. The
     * status is snapshotted at UI_COLS, so budget the prefix on top. */
    char line[UI_COLS + 12];
    char st[UI_COLS + 1];
    str_snapshot(st, sizeof st, m->status ? m->status : "");
-   (void)snprintf(line, sizeof line, "STEALO  %s", st);
+   (void)snprintf(line, sizeof line, "PANCRA  %s", st);
    draw_str(px, fb, 2 * sc, y, sc, line, 0xFFFFFFFF);
    y += 9 * sc;
    /* total rounded to 10s so ambient chatter doesn't churn the line */
@@ -2200,7 +2200,7 @@ static void render_gate(struct ANativeWindow_Buffer *fb, struct hits *h)
    if (gvsc < sc)
       sc = gvsc;
    static const char *lines[] = {
-       "STEALO reads your CGM",
+       "PANCRA reads your CGM",
        "sensor over Bluetooth and",
        "warns you of highs and lows.",
        "",

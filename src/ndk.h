@@ -8,8 +8,8 @@
  * <android/native_window.h>). All the NDK constants live here, not scattered
  * through the sources. The host offline UI harness provides mock definitions of
  * the ANativeWindow_* functions (see test/). */
-#ifndef STEALO_NDK_H
-#define STEALO_NDK_H
+#ifndef PANCRA_NDK_H
+#define PANCRA_NDK_H
 
 #include <jni.h> /* JavaVM, JNIEnv, jobject in ANativeActivity */
 #include <stddef.h>

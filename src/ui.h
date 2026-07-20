@@ -2,8 +2,8 @@
 // ui.h --- On-screen rendering + touch input (the interactive UI layer)
 // Copyright 2026 Jakob Kastelic
 
-#ifndef STEALO_UI_H
-#define STEALO_UI_H
+#ifndef PANCRA_UI_H
+#define PANCRA_UI_H
 
 #include "ndk.h"
 #include "sensors.h" /* sensor types/kinds the model and renderer share */

@@ -2,7 +2,7 @@
 // dexdriver.c --- Dexcom ctx->pairing/reconnect protocol state machine
 // Copyright 2026 Jakob Kastelic
 
-/* stealo protocol driver -- transport-agnostic Dexcom ctx->pairing/reconnect
+/* pancra protocol driver -- transport-agnostic Dexcom ctx->pairing/reconnect
  * state machine. See dexdriver.h. Event-driven: each transport callback
  * advances the state and issues the next operation via the drv_* hooks. Heavily
  * logged.
@@ -26,7 +26,7 @@
 #include <string.h>
 
 int __android_log_print(int prio, const char *tag, const char *fmt, ...);
-#define LOGI(...) __android_log_print(4, "stealo", __VA_ARGS__)
+#define LOGI(...) __android_log_print(4, "pancra", __VA_ARGS__)
 
 /* Per-sensor driver state.
  *
@@ -1022,8 +1022,8 @@ void driver_on_notify(const char *uuid, const uint8_t *buf, int n)
              * fabricated readings at the right edge of the plot. last_clock is
              * only set by a 0x4e, and goto_stream requests one first, so the
              * benign ordering is normal -- but a post-auth peer controls the
-             * order, and stealo_backfill has no age bound of its own to catch
-             * it (unlike stealo_glucose). */
+             * order, and pancra_backfill has no age bound of its own to catch
+             * it (unlike pancra_glucose). */
             if (!ctx->last_clock) {
                LOGI("     skipped: no session clock yet");
                continue;

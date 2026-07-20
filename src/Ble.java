@@ -9,7 +9,7 @@
  *   - serialises GATT operations (Android allows one in flight at a time),
  *   - forwards connection events, notifications and write-acks to native.
  */
-package com.jk.stealo;
+package com.jk.pancra;
 
 import android.bluetooth.BluetoothAdapter;
 import android.bluetooth.BluetoothDevice;
@@ -36,7 +36,7 @@ import java.util.ArrayDeque;
 import java.util.UUID;
 
 public final class Ble {
-    private static final String TAG = "stealo";
+    private static final String TAG = "pancra";
     private static final UUID CCCD =
         UUID.fromString("00002902-0000-1000-8000-00805f9b34fb");
 
@@ -44,24 +44,24 @@ public final class Ble {
 
     /* EXPORT DATA: build ONE file -- sensors.csv (the device map), a blank line,
      * then readings.csv (the log) -- and hand it to another app via the system
-     * share sheet. The content:// URI comes from StealoFiles (see the manifest);
+     * share sheet. The content:// URI comes from PancraFiles (see the manifest);
      * FLAG_GRANT_READ_URI_PERMISSION lets the chosen app read it. */
     public static void exportData(Context ctx) {
         try {
             java.io.File dir = ctx.getFilesDir();
-            java.io.File out = new java.io.File(dir, "stealo.csv");
+            java.io.File out = new java.io.File(dir, "pancra.csv");
             java.io.FileOutputStream os = new java.io.FileOutputStream(out);
             copyInto(os, new java.io.File(dir, "sensors.csv"));
             os.write('\n'); /* blank line between the two sections */
             copyInto(os, new java.io.File(dir, "readings.csv"));
             os.close();
             if (out.length() == 0) return;
-            Uri uri = Uri.parse("content://com.jk.stealo.files/stealo.csv");
+            Uri uri = Uri.parse("content://com.jk.pancra.files/pancra.csv");
             Intent send = new Intent(Intent.ACTION_SEND);
             send.putExtra(Intent.EXTRA_STREAM, uri);
             send.setType("text/csv");
             send.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
-            Intent chooser = Intent.createChooser(send, "Export stealo data");
+            Intent chooser = Intent.createChooser(send, "Export pancra data");
             chooser.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
             ctx.startActivity(chooser);
         } catch (Throwable t) { Log.i(TAG, "export: " + t); }
@@ -150,15 +150,15 @@ public final class Ble {
     /* start the foreground service so BLE keeps running in the background, and
      * ask to be exempted from battery optimisation so Doze can't kill us */
     public static void startService(Context ctx) {
-        StealoService.start(ctx);
-        StealoService.requestNoBatteryOpt(ctx);
+        PancraService.start(ctx);
+        PancraService.requestNoBatteryOpt(ctx);
     }
 
     /* Push the live glucose + a 3H plot bitmap into the ongoing notification
      * (shown on the lock screen / shade). Called from native each reading. */
     public static void showGlucose(Context ctx, String title, String text,
                                    int[] px, int w, int h) {
-        StealoService.showGlucose(ctx, title, text, px, w, h);
+        PancraService.showGlucose(ctx, title, text, px, w, h);
     }
 
     /* ---- Java -> C callbacks (bound via RegisterNatives in dexble.c) ---- */

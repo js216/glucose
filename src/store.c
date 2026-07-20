@@ -15,7 +15,7 @@
 #include <stdio.h>  /* snprintf, SEEK_SET / SEEK_END */
 
 int __android_log_print(int prio, const char *tag, const char *fmt, ...);
-#define LOGW(...) __android_log_print(5, "stealo", __VA_ARGS__)
+#define LOGW(...) __android_log_print(5, "pancra", __VA_ARGS__)
 
 /* Read one comma-separated integer field and step past its separator. Sets
  * *present (when given) to whether the field held any digits at all, which is

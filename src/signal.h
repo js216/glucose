@@ -3,8 +3,8 @@
 // Copyright 2026 Jakob Kastelic
 
 /* Minimal freestanding <signal.h> shim (see string.h for the rationale). */
-#ifndef STEALO_SIGNAL_H
-#define STEALO_SIGNAL_H
+#ifndef PANCRA_SIGNAL_H
+#define PANCRA_SIGNAL_H
 
 void (*signal(int sig, void (*handler)(int)))(int);
 int raise(int sig);

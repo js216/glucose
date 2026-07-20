@@ -2,8 +2,8 @@
 // stats.h --- Rolling glucose stats (time-in-range / average)
 // Copyright 2026 Jakob Kastelic
 
-#ifndef STEALO_STATS_H
-#define STEALO_STATS_H
+#ifndef PANCRA_STATS_H
+#define PANCRA_STATS_H
 
 /* O(1) per reading via hourly buckets; O(days*24) to read a rolling window. */
 void stat_add(long t, int glu);

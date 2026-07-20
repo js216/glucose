@@ -8,8 +8,8 @@
  * that satisfies <stdio.h>. va_list comes from clang's own <stdarg.h>. Only the
  * bounded snprintf we actually call is declared; the phone's real bionic binds
  * it at runtime (see stub_c.c). */
-#ifndef STEALO_STDIO_H
-#define STEALO_STDIO_H
+#ifndef PANCRA_STDIO_H
+#define PANCRA_STDIO_H
 
 #include <stddef.h>
 

@@ -13,7 +13,7 @@
  * on demand; the notification is kept silent and used only for the heads-up
  * banner when the app isn't in front. The tone is the device's Default alarm
  * sound (Settings > Sound > Default alarm sound). */
-package com.jk.stealo;
+package com.jk.pancra;
 
 import android.app.Notification;
 import android.app.NotificationChannel;
@@ -30,7 +30,7 @@ import android.os.Vibrator;
 import android.util.Log;
 
 public final class Alarm {
-    private static final String CH = "stealo-alarm";
+    private static final String CH = "pancra-alarm";
     private static final int NID = 2;              /* distinct from the service's id 1 */
     private static MediaPlayer player;
     /* trigger() runs on a BLE binder thread, silence() on the main looper.
@@ -60,8 +60,8 @@ public final class Alarm {
                 android.media.AudioManager.STREAM_MUSIC, 100);
             boolean ok = toneGen.startTone(
                 android.media.ToneGenerator.TONE_PROP_BEEP, 200);
-            Log.i("stealo", "beep startTone=" + ok);
-        } catch (Throwable t) { Log.i("stealo", "beep: " + t); }
+            Log.i("pancra", "beep startTone=" + ok);
+        } catch (Throwable t) { Log.i("pancra", "beep: " + t); }
     }
 
     private static void ensureChannel(NotificationManager nm) {
@@ -89,7 +89,7 @@ public final class Alarm {
     public static synchronized void trigger(Context ctx, int kind, boolean sound, boolean vibrate) {
         Context app;
         try { app = ctx.getApplicationContext(); }
-        catch (Throwable t) { Log.i("stealo", "alarm trigger (context): " + t); return; }
+        catch (Throwable t) { Log.i("pancra", "alarm trigger (context): " + t); return; }
 
         /* 1. Sound. */
         try {
@@ -113,7 +113,7 @@ public final class Alarm {
              * allocated but not looping, and silence() would then release an
              * object that is not making noise while the real problem persists. */
             stopSound();
-            Log.i("stealo", "alarm trigger (sound): " + t);
+            Log.i("pancra", "alarm trigger (sound): " + t);
         }
 
         /* 2. Vibration -- the fallback when the phone is muted.
@@ -132,7 +132,7 @@ public final class Alarm {
                 if (vibrate && v.hasVibrator())   /* 600ms on / 400ms off, repeating */
                     v.vibrate(VibrationEffect.createWaveform(new long[]{0, 600, 400}, 0));
             }
-        } catch (Throwable t) { Log.i("stealo", "alarm trigger (vibrate): " + t); }
+        } catch (Throwable t) { Log.i("pancra", "alarm trigger (vibrate): " + t); }
 
         /* 3. Notification -- informational; must never suppress 1 or 2. */
         try {
@@ -156,7 +156,7 @@ public final class Alarm {
                 .setOngoing(true)
                 .build();
             nm.notify(NID, n);
-        } catch (Throwable t) { Log.i("stealo", "alarm trigger (notify): " + t); }
+        } catch (Throwable t) { Log.i("pancra", "alarm trigger (notify): " + t); }
     }
 
     /* Staged for the same reason as trigger(), and it matters MORE here.
@@ -170,21 +170,21 @@ public final class Alarm {
      * FIRST and unconditionally. */
     public static synchronized void silence(Context ctx) {
         try { stopSound(); }
-        catch (Throwable t) { Log.i("stealo", "alarm silence (sound): " + t); }
+        catch (Throwable t) { Log.i("pancra", "alarm silence (sound): " + t); }
 
         Context app;
         try { app = ctx.getApplicationContext(); }
-        catch (Throwable t) { Log.i("stealo", "alarm silence (context): " + t); return; }
+        catch (Throwable t) { Log.i("pancra", "alarm silence (context): " + t); return; }
 
         try {
             Vibrator v = app.getSystemService(Vibrator.class);
             if (v != null) v.cancel();
-        } catch (Throwable t) { Log.i("stealo", "alarm silence (vibrate): " + t); }
+        } catch (Throwable t) { Log.i("pancra", "alarm silence (vibrate): " + t); }
 
         try {
             NotificationManager nm = app.getSystemService(NotificationManager.class);
             if (nm != null) nm.cancel(NID);
-        } catch (Throwable t) { Log.i("stealo", "alarm silence (notify): " + t); }
+        } catch (Throwable t) { Log.i("pancra", "alarm silence (notify): " + t); }
     }
 
     /* release() gets its OWN try, and the reference is dropped last.
@@ -197,8 +197,8 @@ public final class Alarm {
     private static void stopSound() {
         MediaPlayer p = player;
         if (p == null) return;
-        try { p.stop(); } catch (Throwable t) { Log.i("stealo", "stop: " + t); }
-        try { p.release(); } catch (Throwable t) { Log.i("stealo", "release: " + t); }
+        try { p.stop(); } catch (Throwable t) { Log.i("pancra", "stop: " + t); }
+        try { p.release(); } catch (Throwable t) { Log.i("pancra", "release: " + t); }
         player = null;
     }
 }

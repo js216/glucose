@@ -2,8 +2,8 @@
 // store.h --- Reading history + append-only persistent log (data model)
 // Copyright 2026 Jakob Kastelic
 
-#ifndef STEALO_STORE_H
-#define STEALO_STORE_H
+#ifndef PANCRA_STORE_H
+#define PANCRA_STORE_H
 
 /* Master reading history. This is the DISPLAY buffer the plot draws from, and
  * its size is what bounds how far back the longest plot span (7D = 168 h) can

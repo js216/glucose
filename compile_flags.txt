@@ -1,5 +1,0 @@
---target=aarch64-linux-android29
--ffreestanding
--Isrc
--I/usr/lib/jvm/default-java/include
--I/usr/lib/jvm/default-java/include/linux

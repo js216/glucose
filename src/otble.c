@@ -23,8 +23,8 @@
 #include <stdint.h>
 
 int __android_log_print(int prio, const char *tag, const char *fmt, ...);
-#define LOGI(...) __android_log_print(4, "stealo", __VA_ARGS__)
-#define LOGW(...) __android_log_print(5, "stealo", __VA_ARGS__)
+#define LOGI(...) __android_log_print(4, "pancra", __VA_ARGS__)
+#define LOGW(...) __android_log_print(5, "pancra", __VA_ARGS__)
 
 enum {
    P_IDLE = 0,

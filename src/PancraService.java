@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0
-// StealoService.java --- Foreground service keeping BLE alive
+// PancraService.java --- Foreground service keeping BLE alive
 // Copyright 2026 Jakob Kastelic
 
 /* Foreground service: keeps the process alive (and BLE-exempt from Doze) so the
@@ -11,7 +11,7 @@
  * reconnect/parse path regardless of the Activity's lifecycle. This service
  * exists only to hold foreground priority (with an ongoing notification) so the
  * OS does not kill the process. Started by the activity at launch. */
-package com.jk.stealo;
+package com.jk.pancra;
 
 import android.app.AlarmManager;
 import android.app.Notification;
@@ -31,9 +31,9 @@ import android.os.SystemClock;
 import android.provider.Settings;
 import android.util.Log;
 
-public final class StealoService extends Service {
-    private static final String CH = "stealo";
-    private static final String ACTION_WAKE = "com.jk.stealo.WAKE";
+public final class PancraService extends Service {
+    private static final String CH = "pancra";
+    private static final String ACTION_WAKE = "com.jk.pancra.WAKE";
     private static final long WAKE_INTERVAL_MS = 5 * 60 * 1000L;   /* ~one sensor cycle */
     private static PowerManager.WakeLock wakelock;
 
@@ -45,19 +45,19 @@ public final class StealoService extends Service {
         try {
             if (wakelock == null) {
                 PowerManager pm = getSystemService(PowerManager.class);
-                wakelock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "stealo:ble");
+                wakelock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "pancra:ble");
                 wakelock.setReferenceCounted(false);
             }
             if (!wakelock.isHeld()) wakelock.acquire();
-        } catch (Throwable t) { Log.i("stealo", "wakelock: " + t); }
+        } catch (Throwable t) { Log.i("pancra", "wakelock: " + t); }
     }
 
     /* called by native (via Ble.startService) at activity create */
     public static void start(Context ctx) {
         try {
             Context app = ctx.getApplicationContext();
-            app.startForegroundService(new Intent(app, StealoService.class));
-        } catch (Throwable t) { Log.i("stealo", "startService: " + t); }
+            app.startForegroundService(new Intent(app, PancraService.class));
+        } catch (Throwable t) { Log.i("pancra", "startService: " + t); }
     }
 
     /* Ask the user to exempt us from battery optimisation. Without this, Doze can
@@ -73,7 +73,7 @@ public final class StealoService extends Service {
                                   Uri.parse("package:" + pkg));
             i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
             ctx.startActivity(i);
-        } catch (Throwable t) { Log.i("stealo", "batteryOpt: " + t); }
+        } catch (Throwable t) { Log.i("pancra", "batteryOpt: " + t); }
     }
 
     /* Resolve the app's pixel-droplet notification icon at runtime (this build
@@ -87,7 +87,7 @@ public final class StealoService extends Service {
     private Notification build() {
         NotificationManager nm = getSystemService(NotificationManager.class);
         nm.createNotificationChannel(
-            new NotificationChannel(CH, "Stealo", NotificationManager.IMPORTANCE_LOW));
+            new NotificationChannel(CH, "Pancra", NotificationManager.IMPORTANCE_LOW));
         /* tapping the notification brings the app back to the foreground */
         Intent open = new Intent(this, android.app.NativeActivity.class);
         open.setAction(Intent.ACTION_MAIN);
@@ -96,7 +96,7 @@ public final class StealoService extends Service {
         PendingIntent pi = PendingIntent.getActivity(this, 0, open,
             PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
         return new Notification.Builder(this, CH)
-            .setContentTitle("Stealo")
+            .setContentTitle("Pancra")
             .setContentText("Reading glucose")
             .setSmallIcon(notifIcon(this))
             .setContentIntent(pi)
@@ -115,7 +115,7 @@ public final class StealoService extends Service {
             Context app = ctx.getApplicationContext();
             NotificationManager nm = app.getSystemService(NotificationManager.class);
             nm.createNotificationChannel(
-                new NotificationChannel(CH, "Stealo", NotificationManager.IMPORTANCE_LOW));
+                new NotificationChannel(CH, "Pancra", NotificationManager.IMPORTANCE_LOW));
             Intent open = new Intent(app, android.app.NativeActivity.class);
             open.setAction(Intent.ACTION_MAIN);
             open.addCategory(Intent.CATEGORY_LAUNCHER);
@@ -134,7 +134,7 @@ public final class StealoService extends Service {
                 b.setStyle(new Notification.BigPictureStyle().bigPicture(bmp));
             }
             nm.notify(1, b.build());
-        } catch (Throwable t) { Log.i("stealo", "showGlucose: " + t); }
+        } catch (Throwable t) { Log.i("pancra", "showGlucose: " + t); }
     }
 
     /* Re-arm a periodic wake. Stelo disconnects after every reading, so between
@@ -147,12 +147,12 @@ public final class StealoService extends Service {
         try {
             AlarmManager am = getSystemService(AlarmManager.class);
             if (am == null) return;
-            Intent i = new Intent(this, StealoService.class).setAction(ACTION_WAKE);
+            Intent i = new Intent(this, PancraService.class).setAction(ACTION_WAKE);
             PendingIntent pi = PendingIntent.getForegroundService(this, 1, i,
                 PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
             am.setAndAllowWhileIdle(AlarmManager.ELAPSED_REALTIME_WAKEUP,
                 SystemClock.elapsedRealtime() + WAKE_INTERVAL_MS, pi);
-        } catch (Throwable t) { Log.i("stealo", "scheduleWake: " + t); }
+        } catch (Throwable t) { Log.i("pancra", "scheduleWake: " + t); }
     }
 
     @Override public int onStartCommand(Intent i, int flags, int startId) {
@@ -161,7 +161,7 @@ public final class StealoService extends Service {
                 startForeground(1, build(), ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE);
             else
                 startForeground(1, build());
-        } catch (Throwable t) { Log.i("stealo", "startForeground: " + t); }
+        } catch (Throwable t) { Log.i("pancra", "startForeground: " + t); }
         /* i == null means the system restarted us on its own (START_STICKY) with no
          * activity — BLE lives in the activity's native lib, so this would be a
          * zombie (notification + wakelock, reading nothing). Don't auto-restart:
@@ -177,9 +177,9 @@ public final class StealoService extends Service {
      * process (and thus the live BLE connection) is not torn down. */
     @Override public void onTaskRemoved(Intent rootIntent) {
         try {
-            Intent restart = new Intent(getApplicationContext(), StealoService.class);
+            Intent restart = new Intent(getApplicationContext(), PancraService.class);
             getApplicationContext().startForegroundService(restart);
-        } catch (Throwable t) { Log.i("stealo", "onTaskRemoved: " + t); }
+        } catch (Throwable t) { Log.i("pancra", "onTaskRemoved: " + t); }
     }
 
     /* Service-owned heartbeat.
@@ -209,7 +209,7 @@ public final class StealoService extends Service {
                 Ble.onTick();
                 android.os.Handler h = tick;   /* read once */
                 if (h != null) h.postDelayed(this, TICK_MS);
-            } catch (Throwable t) { Log.i("stealo", "tick: " + t); }
+            } catch (Throwable t) { Log.i("pancra", "tick: " + t); }
         }
     };
 
@@ -226,7 +226,7 @@ public final class StealoService extends Service {
          * already inside that critical section the main looper SPINS waiting for
          * it. An ANR here would kill the process holding the CGM connection,
          * i.e. the alarm itself. */
-        tickThread = new android.os.HandlerThread("stealo-tick");
+        tickThread = new android.os.HandlerThread("pancra-tick");
         tickThread.start();
         tick = new android.os.Handler(tickThread.getLooper());
         tick.postDelayed(ticker, TICK_MS);
@@ -241,7 +241,7 @@ public final class StealoService extends Service {
          * BLE work at all -- a battery drain with no upside. */
         try {
             if (wakelock != null && wakelock.isHeld()) wakelock.release();
-        } catch (Throwable t) { Log.i("stealo", "wakelock release: " + t); }
+        } catch (Throwable t) { Log.i("pancra", "wakelock release: " + t); }
         super.onDestroy();
     }
 

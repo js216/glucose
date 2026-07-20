@@ -3,8 +3,8 @@
 // Copyright 2026 Jakob Kastelic
 
 /* Minimal freestanding <stdlib.h> shim (see string.h for the rationale). */
-#ifndef STEALO_STDLIB_H
-#define STEALO_STDLIB_H
+#ifndef PANCRA_STDLIB_H
+#define PANCRA_STDLIB_H
 
 #include <stddef.h>
 

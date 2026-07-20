@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0
-# stealo: plain-C Android app, no Gradle. `make run` builds, installs, launches.
+# pancra: plain-C Android app, no Gradle. `make run` builds, installs, launches.
 CLANG     := /usr/lib/llvm-19/bin/clang
 STRIP     := /usr/lib/llvm-19/bin/llvm-strip
 TARGET    := aarch64-linux-android29
@@ -16,8 +16,8 @@ D8        := java -cp tmp/tools/r8.jar com.android.tools.r8.D8
 # javac: only -target 8 still allows -bootclasspath; d8 desugars 8 fine
 JAVACFLAGS := -Xlint:-options -source 8 -target 8 -bootclasspath tmp/tools/android.jar
 
-APK  := build/stealo.apk
-LIB  := build/apk/lib/arm64-v8a/libstealo.so
+APK  := build/pancra.apk
+LIB  := build/apk/lib/arm64-v8a/libpancra.so
 DEX  := build/apk/classes.dex
 # kept OUTSIDE build/ so `make clean` can't wipe it — a regenerated key changes
 # the APK signature and blocks in-place updates (forcing an uninstall/data loss)
@@ -61,13 +61,13 @@ $(LIB): $(SRC) $(HDR) $(STUBS)
 	    -Wl,--no-undefined -Lbuild/stub -lc -landroid -llog -o $@ $(SRC)
 	$(STRIP) $@
 
-build/classes/com/jk/stealo/Ble.class: src/Ble.java src/StealoService.java src/Alarm.java src/StealoFiles.java
-	javac $(JAVACFLAGS) -d build/classes src/Ble.java src/StealoService.java src/Alarm.java src/StealoFiles.java
+build/classes/com/jk/pancra/Ble.class: src/Ble.java src/PancraService.java src/Alarm.java src/PancraFiles.java
+	javac $(JAVACFLAGS) -d build/classes src/Ble.java src/PancraService.java src/Alarm.java src/PancraFiles.java
 
-$(DEX): build/classes/com/jk/stealo/Ble.class
+$(DEX): build/classes/com/jk/pancra/Ble.class
 	@mkdir -p $(@D)
 	$(D8) --release --min-api 29 --lib tmp/tools/android.jar --output $(@D) \
-	    build/classes/com/jk/stealo/*.class
+	    build/classes/com/jk/pancra/*.class
 
 $(KEY):
 	keytool -genkeypair -keystore $@ -alias debug -keyalg RSA -keysize 2048 \
@@ -84,15 +84,15 @@ build/.aapt-mode: FORCE
 
 $(APK): AndroidManifest.xml $(LIB) $(DEX) $(KEY) $(RES) build/.aapt-mode
 	aapt package -f -M AndroidManifest.xml -S res -I $(FRAMEWORK) $(AAPT_DEBUG) \
-	    -F build/stealo.unaligned.apk
-	cd build/apk && aapt add ../stealo.unaligned.apk lib/arm64-v8a/libstealo.so classes.dex
-	zipalign -f -p 4 build/stealo.unaligned.apk $@
+	    -F build/pancra.unaligned.apk
+	cd build/apk && aapt add ../pancra.unaligned.apk lib/arm64-v8a/libpancra.so classes.dex
+	zipalign -f -p 4 build/pancra.unaligned.apk $@
 	apksigner sign --ks $(KEY) --ks-pass pass:android $@
 
 # Release artifact: identical build with debuggable off. Still signed with the
 # local debug key -- swap in your Play upload key (apksigner --ks) before upload.
 release:
-	rm -f $(APK) build/stealo.unaligned.apk
+	rm -f $(APK) build/pancra.unaligned.apk
 	$(MAKE) AAPT_DEBUG= $(APK)
 	@printf '\033[1;32mrelease\033[0m: %s built with debuggable=false.\n' "$(APK)"
 	@printf '  Sign with your Play upload key before uploading.\n'
@@ -100,9 +100,9 @@ release:
 # Play App Bundle (.aab), built without Gradle: aapt2 links resources in
 # protobuf format, we assemble bundletool's module layout, then build-bundle.
 # debuggable is off (an .aab is a release artifact). The result is UNSIGNED --
-# sign it with your upload key (jarsigner -keystore upload.jks build/stealo.aab)
+# sign it with your upload key (jarsigner -keystore upload.jks build/pancra.aab)
 # or let Play App Signing handle it. Requires tmp/tools/bundletool.jar.
-AAB        := build/stealo.aab
+AAB        := build/pancra.aab
 BUNDLETOOL := java -jar tmp/tools/bundletool.jar
 
 aab: $(AAB)
@@ -125,10 +125,10 @@ install: $(APK)
 	adb install -r $(APK)
 
 run: install
-	adb shell am start -n com.jk.stealo/android.app.NativeActivity
+	adb shell am start -n com.jk.pancra/android.app.NativeActivity
 
 uninstall:
-	adb uninstall com.jk.stealo
+	adb uninstall com.jk.pancra
 
 clean:
 	rm -rf build
@@ -156,7 +156,7 @@ TIDY_ARGS := --target=$(TARGET) -ffreestanding $(JNI_INC)
 # main.c passed the entire gate and failed only the library link, and
 # appending garbage to Alarm.java left the gate green as well. That left every
 # one of the 14 -Werror flags ungated across ~3900 lines of main.c, and the
-# whole alarm actuation end (Alarm.java, StealoService.java, Ble.java)
+# whole alarm actuation end (Alarm.java, PancraService.java, Ble.java)
 # unchecked by anything.
 check: format tidy crosscheck javacheck $(LIB) $(DEX) uitest drivertest alarmtest storetest statstest metertest registrytest settingstest scantest done
 
@@ -204,7 +204,7 @@ crosscheck:
 	 printf '\033[1;32mcrosscheck\033[0m: NHIST == UI_PLOT_MAX (%s)\n' "$$n"
 
 # A STOPGAP, and labelled as one. There is no Java test binary -- Ble, Alarm and
-# StealoService are almost entirely Android API calls, so exercising them needs
+# PancraService are almost entirely Android API calls, so exercising them needs
 # a device or Robolectric. javac + d8 therefore gate syntax and types only, and
 # an adversarial review proved two severe mutants survive the whole check:
 # Alarm.silence() made a no-op (the C side records the alarm as dismissed while

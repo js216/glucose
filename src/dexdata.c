@@ -4,7 +4,7 @@
 
 /* Dexcom G7 / Stelo glucose decoding.
  *
- * Two on-wire shapes (see NOTES.md):
+ * Two on-wire shapes:
  *   - backfill / EGV record: 9 bytes  [tsU32LE | gluU16LE | 3 status bytes]
  *   - current-EGV control response (opcode 0x4e): >=19 bytes, richer layout
  *
